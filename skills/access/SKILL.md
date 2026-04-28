@@ -35,7 +35,17 @@ Arguments passed: `$ARGUMENTS`
   "dmPolicy": "pairing",
   "allowFrom": ["<senderId>", ...],
   "groups": {
-    "<groupId>": { "requireMention": true, "allowFrom": [] }
+    "<groupId>": {
+      "requireMention": true,
+      "allowFrom": [],
+      "topics": {
+        "<topicId>": {
+          "requireMention": false,
+          "allowFrom": ["<senderId>", ...],
+          "enabled": true
+        }
+      }
+    }
   },
   "pending": {
     "<6-char-code>": {
@@ -49,6 +59,10 @@ Arguments passed: `$ARGUMENTS`
 
 Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, pending:{}}`.
 
+`groups[<groupId>].topics[<topicId>]` is optional. Each topic field is
+optional too — missing fields inherit from the group. `enabled: false`
+drops every message in that topic silently.
+
 ---
 
 ## Dispatch on arguments
@@ -60,6 +74,10 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 1. Read `~/.claude/channels/telegram/access.json` (handle missing file).
 2. Show: dmPolicy, allowFrom count and list, pending count with codes +
    sender IDs + age, groups count.
+3. For each group, list configured topics indented underneath. For each
+   topic show: `<topicId>: requireMention=…, allowFrom=[…], enabled=…`,
+   omitting fields the topic inherits from the group. Mark
+   `enabled: false` topics as disabled.
 
 ### `pair <code>`
 
@@ -105,6 +123,38 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `group rm <groupId>`
 
 1. Read, `delete groups[<groupId>]`, write.
+
+### `topic add <chatId> <topicId>` (optional: `--no-mention`, `--mention`, `--allow id1,id2`)
+
+1. Read access.json. If `groups[<chatId>]` is missing, stop and tell the
+   user to run `/telegram:access group add <chatId>` first — topics
+   require an enabled parent group.
+2. Set `groups[<chatId>].topics[<topicId>]` to an object containing only
+   the fields the user explicitly asked to override:
+   - `--no-mention` → `requireMention: false`
+   - `--mention` → `requireMention: true`
+   - `--allow a,b` → `allowFrom: ["a","b"]`
+   - never set `enabled` here; default = inherit (treated as enabled)
+3. Omit fields the user didn't pass so they inherit from the group.
+4. Write.
+
+### `topic rm <chatId> <topicId>`
+
+1. Read, `delete groups[<chatId>].topics[<topicId>]`, write.
+2. If `groups[<chatId>].topics` becomes empty, delete the `topics` key
+   too so the file stays tidy.
+
+### `topic disable <chatId> <topicId>` / `topic enable <chatId> <topicId>`
+
+1. Read access.json. If `groups[<chatId>]` is missing, stop and tell the
+   user.
+2. `disable` → set `groups[<chatId>].topics[<topicId>].enabled = false`,
+   creating the topic entry if missing.
+3. `enable` → if a topic entry exists, delete the `enabled` field (so it
+   reverts to inherited/enabled). If the topic entry is otherwise empty,
+   delete it. If no topic entry exists, do nothing — it's already
+   enabled by inheritance.
+4. Write.
 
 ### `set <key> <value>`
 
