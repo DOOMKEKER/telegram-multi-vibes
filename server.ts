@@ -281,12 +281,19 @@ function gate(ctx: Context): GateResult {
     const groupId = String(ctx.chat!.id)
     const policy = access.groups[groupId]
     if (!policy) return { action: 'drop' }
-    const groupAllowFrom = policy.allowFrom ?? []
-    const requireMention = policy.requireMention ?? true
-    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
+
+    // Forum topic overrides: a topic entry can disable, or override
+    // requireMention/allowFrom. Missing fields inherit from the group.
+    const threadId = ctx.message?.message_thread_id
+    const topic = threadId != null ? policy.topics?.[String(threadId)] : undefined
+    if (topic?.enabled === false) return { action: 'drop' }
+
+    const effectiveAllowFrom = topic?.allowFrom ?? policy.allowFrom ?? []
+    const effectiveRequireMention = topic?.requireMention ?? policy.requireMention ?? true
+    if (effectiveAllowFrom.length > 0 && !effectiveAllowFrom.includes(senderId)) {
       return { action: 'drop' }
     }
-    if (requireMention && !isMentioned(ctx, access.mentionPatterns)) {
+    if (effectiveRequireMention && !isMentioned(ctx, access.mentionPatterns)) {
       return { action: 'drop' }
     }
     return { action: 'deliver', access }
