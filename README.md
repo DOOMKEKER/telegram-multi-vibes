@@ -4,7 +4,12 @@ Connect a Telegram bot to your Claude Code with an MCP server. Forked from [`cla
 
 The MCP server logs into Telegram as a bot and provides tools to Claude to reply, react, or edit messages. When you message the bot, the server forwards the message to your Claude Code session.
 
-This fork adds **forum topic awareness**: messages from supergroup topics carry `thread_id`, and replies thread back into the originating topic. See [ACCESS.md](./ACCESS.md#forum-topics) for the per-topic access schema. Multi-session support (one bot driving several Claude Code sessions, each bound to a topic) is the next milestone — see the project tracker.
+This fork adds **topic awareness** end-to-end. Two flavours of topics work the same way in code:
+
+1. **Threaded Mode in DMs (Bot API 9.4+, recommended for personal use).** Toggle it on in @BotFather's mini-app: open BotFather's profile, tap **Open App**, pick your bot, **Bot Settings → Threaded Mode**. Once on, your DM with the bot becomes a forum — you can create topics inside the chat, and each topic carries its own `message_thread_id`. Messages arrive with `thread_id` in the `<channel>` meta and replies thread back automatically. No supergroup needed.
+2. **Forum supergroups** also work. The same `thread_id` plumbing applies, plus per-topic access policy via `/telegram:access topic …` — see [ACCESS.md](./ACCESS.md#topics).
+
+Multi-session support (one bot driving several concurrent Claude Code sessions, each bound to a topic) is the next milestone.
 
 ## Prerequisites
 

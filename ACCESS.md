@@ -61,11 +61,32 @@ With the default `requireMention: true`, the bot responds only when @mentioned o
 
 **Privacy mode.** Telegram bots default to a server-side privacy mode that filters group messages before they reach your code: only @mentions and replies are delivered. This matches the default `requireMention: true`, so it's normally invisible. Using `--no-mention` requires disabling privacy mode as well: message [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Without that step, Telegram never delivers the messages regardless of local config.
 
-## Forum topics
+## Topics
 
-Supergroups with **Topics** enabled (group settings → Topics) carry a `message_thread_id` on every message. The plugin surfaces it as `thread_id` in the `<channel>` block's `meta`, and the `reply` tool accepts it back so responses thread into the same topic. Typing indicators thread too.
+Two situations produce `message_thread_id` on inbound messages, and the plugin handles both with the same code: **Threaded Mode in DMs** (the recommended path for personal use, no supergroup needed) and **forum supergroups** (multi-user, with extra per-topic access policy).
 
-Topics are configured under their parent group with optional per-topic overrides. Missing fields inherit from the group:
+In both cases:
+- inbound messages carry `thread_id` in the `<channel>` meta;
+- `reply` accepts a `thread_id` parameter and threads outbound messages back into the originating topic;
+- typing indicators target the same topic;
+- the General topic (`thread_id = 1`) is read-only on send: Telegram rejects explicit `message_thread_id = 1` on `sendMessage` / `sendPhoto` / `sendDocument`, so the plugin omits it for those calls. Reactions and `sendChatAction` (typing) accept `=1` and behave normally.
+
+### Threaded Mode in DMs (Bot API 9.4+)
+
+This turns the user's direct chat with the bot into a forum. The user can create topics inside the DM and each topic carries its own `message_thread_id`. `chat.type` stays `"private"`. Setup:
+
+1. Open Telegram → @BotFather → tap profile → **Open App** (mini-app).
+2. Select your bot → **Settings** → **Bot Settings** → toggle **Threaded Mode** on.
+3. Reload your Claude Code session (`/reload-plugins` or restart with `--channels`).
+4. Open the DM with the bot — the chat header now offers topic creation. Make a topic and send a message in it.
+
+Inbound messages from a Threaded-Mode DM behave like any other DM as far as access control is concerned: the existing `dmPolicy` + `allowFrom` decides whether to accept them. There is **no per-topic access policy in DMs** — once you've allowed yourself, all your DM topics deliver. Topics are routing only.
+
+Outbound replies pass `thread_id` back via the `reply` tool to land in the same topic.
+
+### Forum supergroups
+
+Supergroups with **Topics** enabled (group settings → Topics) carry a `message_thread_id` on every message. Same plumbing as Threaded Mode, plus per-topic access policy under `groups[chatId].topics[topicId]` so different topics in the same group can have different rules. Missing topic fields inherit from the group:
 
 ```jsonc
 {
@@ -104,11 +125,9 @@ Skill commands:
 **Finding a topic ID.** Telegram's UI doesn't show `message_thread_id` directly. The simplest ways:
 
 - Forward a message from the topic to [@RawDataBot](https://t.me/RawDataBot) and look for `message_thread_id` in its JSON dump.
-- Or send any message in the topic, then run `/telegram:access` and check the dropped-from log if the topic isn't in the allowlist yet.
+- Or send any message in the topic, then check the inbound `<channel>` block — `thread_id` is right there in the meta.
 
-**The General topic (`thread_id = 1`).** The General topic of a forum supergroup uses `message_thread_id = 1`. Inbound messages carry it as usual. **Outbound:** Telegram's `sendMessage` rejects an explicit `message_thread_id = 1`, so the plugin omits it on send-class API calls and the message lands in General correctly. `sendChatAction` (typing) does accept `=1`, so the indicator still shows up there.
-
-**Inheritance recap.**
+**Inheritance recap (supergroups only).**
 
 | Topic field | Effect |
 | --- | --- |
@@ -118,7 +137,7 @@ Skill commands:
 | field omitted | Inherits from group |
 | topic entry omitted | Topic inherits group's full policy |
 
-`enabled` has no `true` form — to re-enable a disabled topic, delete the field (`/telegram:access topic enable …`). Topics not listed at all are processed under group rules.
+`enabled` has no `true` form — to re-enable a disabled topic, delete the field (`/telegram:access topic enable …`). Topics not listed at all are processed under group rules. Per-topic policy applies only to forum supergroups; in Threaded-Mode DMs the user's allowlist alone gates access.
 
 ## Mention detection
 
