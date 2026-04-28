@@ -30,3 +30,8 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Bun / TypeScript / Node
+node_modules/
+*.log
+.DS_Store
