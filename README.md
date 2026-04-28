@@ -1,8 +1,10 @@
-# Telegram
+# telegram-multi-vibes
 
-Connect a Telegram bot to your Claude Code with an MCP server.
+Connect a Telegram bot to your Claude Code with an MCP server. Forked from [`claude-plugins-official/telegram`](https://github.com/anthropics/claude-plugins-official/tree/main/external_plugins/telegram) (Apache-2.0); see [LICENSE](./LICENSE).
 
 The MCP server logs into Telegram as a bot and provides tools to Claude to reply, react, or edit messages. When you message the bot, the server forwards the message to your Claude Code session.
+
+This fork adds **forum topic awareness**: messages from supergroup topics carry `thread_id`, and replies thread back into the originating topic. See [ACCESS.md](./ACCESS.md#forum-topics) for the per-topic access schema. Multi-session support (one bot driving several Claude Code sessions, each bound to a topic) is the next milestone — see the project tracker.
 
 ## Prerequisites
 
@@ -74,8 +76,8 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 
 | Tool | Purpose |
 | --- | --- |
-| `reply` | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading and `files` (absolute paths) for attachments. Images (`.jpg`/`.png`/`.gif`/`.webp`) send as photos with inline preview; other types send as documents. Max 50MB each. Auto-chunks text; files send as separate messages after the text. Returns the sent message ID(s). |
-| `react` | Add an emoji reaction to a message by ID. **Only Telegram's fixed whitelist** is accepted (👍 👎 ❤ 🔥 👀 etc). |
+| `reply` | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading, `thread_id` (forum topic) so the reply lands in the same topic, and `files` (absolute paths) for attachments. Images (`.jpg`/`.png`/`.gif`/`.webp`) send as photos with inline preview; other types send as documents. Max 50MB each. Auto-chunks text; files send as separate messages after the text. Returns the sent message ID(s). |
+| `react` | Add an emoji reaction to a message by ID. **Only Telegram's fixed whitelist** is accepted (👍 👎 ❤ 🔥 👀 etc). Reactions are thread-agnostic. |
 | `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
 
 Inbound messages trigger a typing indicator automatically — Telegram shows

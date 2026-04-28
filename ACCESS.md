@@ -61,6 +61,65 @@ With the default `requireMention: true`, the bot responds only when @mentioned o
 
 **Privacy mode.** Telegram bots default to a server-side privacy mode that filters group messages before they reach your code: only @mentions and replies are delivered. This matches the default `requireMention: true`, so it's normally invisible. Using `--no-mention` requires disabling privacy mode as well: message [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Without that step, Telegram never delivers the messages regardless of local config.
 
+## Forum topics
+
+Supergroups with **Topics** enabled (group settings → Topics) carry a `message_thread_id` on every message. The plugin surfaces it as `thread_id` in the `<channel>` block's `meta`, and the `reply` tool accepts it back so responses thread into the same topic. Typing indicators thread too.
+
+Topics are configured under their parent group with optional per-topic overrides. Missing fields inherit from the group:
+
+```jsonc
+{
+  "groups": {
+    "-1001654782309": {
+      "requireMention": true,
+      "allowFrom": [],
+      "topics": {
+        "5": {
+          // override: this topic doesn't need @-mentions
+          "requireMention": false,
+          "allowFrom": ["412587349"]
+        },
+        "8": {
+          // disabled — drop everything in this topic silently
+          "enabled": false
+        },
+        "12": {
+          // empty entry: every field inherits from the group
+        }
+      }
+    }
+  }
+}
+```
+
+Skill commands:
+
+```
+/telegram:access topic add -1001654782309 5 --no-mention --allow 412587349
+/telegram:access topic disable -1001654782309 8
+/telegram:access topic enable -1001654782309 8
+/telegram:access topic rm -1001654782309 12
+```
+
+**Finding a topic ID.** Telegram's UI doesn't show `message_thread_id` directly. The simplest ways:
+
+- Forward a message from the topic to [@RawDataBot](https://t.me/RawDataBot) and look for `message_thread_id` in its JSON dump.
+- Or send any message in the topic, then run `/telegram:access` and check the dropped-from log if the topic isn't in the allowlist yet.
+
+**The General topic (`thread_id = 1`).** The General topic of a forum supergroup uses `message_thread_id = 1`. Inbound messages carry it as usual. **Outbound:** Telegram's `sendMessage` rejects an explicit `message_thread_id = 1`, so the plugin omits it on send-class API calls and the message lands in General correctly. `sendChatAction` (typing) does accept `=1`, so the indicator still shows up there.
+
+**Inheritance recap.**
+
+| Topic field | Effect |
+| --- | --- |
+| `requireMention` set | Overrides group's `requireMention` for messages in this topic |
+| `allowFrom` set | Overrides group's `allowFrom` for messages in this topic |
+| `enabled: false` | Drops every message in this topic silently |
+| field omitted | Inherits from group |
+| topic entry omitted | Topic inherits group's full policy |
+
+`enabled` has no `true` form — to re-enable a disabled topic, delete the field (`/telegram:access topic enable …`). Topics not listed at all are processed under group rules.
+
 ## Mention detection
 
 In groups with `requireMention: true`, any of the following triggers the bot:
