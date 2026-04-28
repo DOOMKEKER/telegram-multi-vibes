@@ -397,6 +397,17 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
+// Telegram's General topic uses message_thread_id=1 on inbound, but
+// sendMessage/sendPhoto/sendDocument REJECT that value. typing/reactions
+// don't care. This helper drops 1 (and non-finite values) so callers
+// don't have to repeat the rule.
+function effectiveSendThreadId(raw: string | number | undefined | null): number | undefined {
+  if (raw == null) return undefined
+  const n = typeof raw === 'string' ? Number(raw) : raw
+  if (!Number.isFinite(n) || n === 1) return undefined
+  return n
+}
+
 const mcp = new Server(
   { name: 'telegram', version: '1.0.0' },
   {
@@ -415,7 +426,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses. If the meta has thread_id, pass it back to reply so the response lands in the same forum topic; omit thread_id for DMs and chats without topics.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -465,7 +476,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, thread_id (forum topic) so the reply lands in the same topic, and files (absolute paths) to attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -474,6 +485,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           reply_to: {
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
+          },
+          thread_id: {
+            type: 'string',
+            description: 'Forum topic ID. Pass back thread_id from the inbound <channel> meta so the reply lands in the same topic. Omit for non-forum chats and DMs.',
           },
           files: {
             type: 'array',
@@ -542,6 +557,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+        const message_thread_id = effectiveSendThreadId(args.thread_id as string | undefined)
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
@@ -563,6 +579,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
 
+        const threadOpt = message_thread_id != null ? { message_thread_id } : {}
+
         try {
           for (let i = 0; i < chunks.length; i++) {
             const shouldReplyTo =
@@ -571,6 +589,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               (replyMode === 'all' || i === 0)
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+              ...threadOpt,
               ...(parseMode ? { parse_mode: parseMode } : {}),
             })
             sentIds.push(sent.message_id)
@@ -587,9 +606,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         for (const f of files) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
+          const baseOpts = reply_to != null && replyMode !== 'off'
             ? { reply_parameters: { message_id: reply_to } }
-            : undefined
+            : {}
+          const opts = { ...baseOpts, ...threadOpt }
           if (PHOTO_EXTS.has(ext)) {
             const sent = await bot.api.sendPhoto(chat_id, input, opts)
             sentIds.push(sent.message_id)
@@ -962,7 +982,10 @@ async function handleInbound(
   }
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  // Telegram accepts message_thread_id on sendChatAction (including =1 for the
+  // General topic), so pass it through whenever the inbound was in a topic.
+  const typingOpts = threadId != null ? { message_thread_id: threadId } : {}
+  void bot.api.sendChatAction(chat_id, 'typing', typingOpts).catch(() => {})
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
