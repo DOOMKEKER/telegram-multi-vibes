@@ -94,9 +94,20 @@ type PendingEntry = {
   replies: number
 }
 
+type TopicPolicy = {
+  /** Override group's requireMention. Inherited from group when omitted. */
+  requireMention?: boolean
+  /** Override group's allowFrom. Inherited from group when omitted. */
+  allowFrom?: string[]
+  /** false → drop all messages from this topic (silent). Default: enabled. */
+  enabled?: boolean
+}
+
 type GroupPolicy = {
   requireMention: boolean
   allowFrom: string[]
+  /** Per-forum-topic overrides keyed by message_thread_id. */
+  topics?: Record<string, TopicPolicy>
 }
 
 type Access = {
