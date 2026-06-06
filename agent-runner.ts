@@ -39,6 +39,8 @@ type SessionRec = {
   lastActivity: number
   /** false until the first successful run (decides --session-id vs --resume). */
   started: boolean
+  /** consecutive failed turns; resets the session after a couple in a row. */
+  fails?: number
 }
 
 const APPEND_SYSTEM_PROMPT =
@@ -173,17 +175,27 @@ async function doTurn(
 
   if (code !== 0) {
     log(`claude exited ${code}: ${stderr.slice(0, 800)}`)
-    // A failed FIRST run leaves a dangling --session-id; drop it so the next
-    // message starts a clean session instead of colliding on the same uuid.
     if (!rec.started) {
+      // A failed FIRST run leaves a dangling --session-id; drop it so the next
+      // message starts a clean session instead of colliding on the same uuid.
       sessions.delete(key)
-      saveSessions()
+    } else {
+      // Self-heal: a resumed session that keeps failing is likely broken. After
+      // a couple of consecutive failures, drop the mapping so the next message
+      // starts a clean session instead of resuming the broken one.
+      rec.fails = (rec.fails ?? 0) + 1
+      if (rec.fails >= 2) {
+        log(`topic ${key}: session failed ${rec.fails}x — resetting to a fresh session`)
+        sessions.delete(key)
+      }
     }
+    saveSessions()
     throw new Error(`agent failed (exit ${code})${stderr ? `: ${stderr.slice(0, 200)}` : ''}`)
   }
 
   if (newSessionId) rec.sessionId = newSessionId
   rec.started = true
+  rec.fails = 0
   rec.lastActivity = Date.now()
   saveSessions()
   return result || '(agent returned empty output)'
