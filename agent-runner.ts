@@ -71,6 +71,25 @@ export function topicKey(chatId: string, threadId: string | undefined): string {
   return `${chatId}:${threadId ?? ''}`
 }
 
+/** Point a topic at a working directory, starting a FRESH session there (a
+ *  running Claude session can't change its cwd, so we reset the mapping). */
+export function setTopicCwd(chatId: string, threadId: string | undefined, cwd: string): void {
+  sessions.set(topicKey(chatId, threadId), {
+    sessionId: randomUUID(),
+    cwd,
+    createdAt: Date.now(),
+    lastActivity: Date.now(),
+    started: false,
+    fails: 0,
+  })
+  saveSessions()
+}
+
+/** The topic's current working directory, or the configured default if unset. */
+export function getTopicCwd(chatId: string, threadId: string | undefined): string {
+  return sessions.get(topicKey(chatId, threadId))?.cwd ?? cfg.cwd
+}
+
 function log(msg: string): void {
   process.stderr.write(`telegram agent: ${msg}\n`)
 }

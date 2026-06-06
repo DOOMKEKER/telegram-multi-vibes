@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd service for the always-on multi-session Telegram daemon.
+
+  Replace the __PLACEHOLDERS__ and save as:
+    ~/Library/LaunchAgents/com.<you>.telegram-daemon.plist
+  Then: launchctl load -w ~/Library/LaunchAgents/com.<you>.telegram-daemon.plist
+
+  Config (token, multi-session, model, voice) lives in
+    ~/.claude/channels/telegram/.env   (the daemon loads it at startup)
+  so it is NOT duplicated here — only PATH is set so the daemon can find
+  bun / claude / ffmpeg / whisper-cli when launched by launchd.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.__YOU__.telegram-daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BUN_PATH__</string>           <!-- e.g. /Users/you/.bun/bin/bun -->
+    <string>daemon.ts</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>             <!-- e.g. /Users/you/dev/telegram-multi-vibes -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:__HOME__/.bun/bin:__HOME__/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.claude/channels/telegram/daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.claude/channels/telegram/daemon.log</string>
+</dict>
+</plist>

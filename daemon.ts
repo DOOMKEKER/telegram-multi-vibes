@@ -22,6 +22,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -35,7 +36,7 @@ import { join } from 'path'
 import { randomBytes } from 'crypto'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { initAgentRunner, runAgentTurn, killAllAgents } from './agent-runner'
+import { initAgentRunner, runAgentTurn, killAllAgents, setTopicCwd, getTopicCwd } from './agent-runner'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import telegramify from 'telegramify-markdown'
@@ -923,24 +924,55 @@ async function handleInbound(
   // back into the same topic. (Phase 1 ignores images/attachments — text only.)
   if (MULTI_SESSION) {
     const tkey = threadId != null ? String(threadId) : undefined
-    if (AGENT_STREAM) {
-      void streamAgentReply(chat_id, threadId, tkey, content, msgId).catch(err => {
-        process.stderr.write(`telegram daemon: agent stream failed: ${err}\n`)
-      })
-    } else {
-      void runAgentTurn(chat_id, tkey, content)
-        .then(reply => sendAgentReply(chat_id, threadId, reply, msgId))
-        .catch(err => {
-          process.stderr.write(`telegram daemon: agent turn failed: ${err}\n`)
-          return sendAgentReply(
-            chat_id,
-            threadId,
-            `⚠️ agent error: ${err instanceof Error ? err.message : String(err)}`,
-            msgId,
-          )
+
+    // Coexistence: if a human session (claude --channels) is bound to this topic
+    // — i.e. a connected client whose claim chat_id matches — let it handle the
+    // message via the normal MCP broadcast below instead of the auto-agent.
+    const humanBound = Array.from(clients.values()).some(
+      c => c.claim.chat_id === chat_id && (!c.claim.thread_id || c.claim.thread_id === tkey),
+    )
+    if (!humanBound) {
+      // Per-topic working directory: /cd <path> binds this topic to a folder
+      // (starts a fresh session there); /pwd shows it.
+      const cd = content.match(/^\/cd\s+(.+)$/)
+      if (cd) {
+        let dir = cd[1].trim()
+        if (dir === '~' || dir.startsWith('~/')) dir = join(homedir(), dir.slice(1))
+        try {
+          const real = realpathSync(dir)
+          if (!statSync(real).isDirectory()) throw new Error('не папка')
+          setTopicCwd(chat_id, tkey, real)
+          void sendAgentReply(chat_id, threadId, `📂 Рабочая папка топика: ${real}\nНачал новую сессию здесь.`, msgId)
+        } catch (e) {
+          void sendAgentReply(chat_id, threadId, `⚠️ Не могу перейти в «${dir}»: ${e instanceof Error ? e.message : String(e)}`, msgId)
+        }
+        return
+      }
+      if (/^\/pwd\s*$/.test(content)) {
+        void sendAgentReply(chat_id, threadId, `📂 ${getTopicCwd(chat_id, tkey)}`, msgId)
+        return
+      }
+
+      if (AGENT_STREAM) {
+        void streamAgentReply(chat_id, threadId, tkey, content, msgId).catch(err => {
+          process.stderr.write(`telegram daemon: agent stream failed: ${err}\n`)
         })
+      } else {
+        void runAgentTurn(chat_id, tkey, content)
+          .then(reply => sendAgentReply(chat_id, threadId, reply, msgId))
+          .catch(err => {
+            process.stderr.write(`telegram daemon: agent turn failed: ${err}\n`)
+            return sendAgentReply(
+              chat_id,
+              threadId,
+              `⚠️ agent error: ${err instanceof Error ? err.message : String(err)}`,
+              msgId,
+            )
+          })
+      }
+      return
     }
-    return
+    // human-bound topic → fall through to the MCP broadcast below
   }
 
   const imagePath = downloadImage ? await downloadImage() : undefined
