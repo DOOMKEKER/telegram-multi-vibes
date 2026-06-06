@@ -88,6 +88,9 @@ const CLAUDE_BIN = process.env.TELEGRAM_CLAUDE_BIN ?? 'claude'
 // Stream the agent's reply into one message (placeholder → live edits). On by
 // default; set TELEGRAM_AGENT_STREAM=0 for a single final message instead.
 const AGENT_STREAM = process.env.TELEGRAM_AGENT_STREAM !== '0'
+// Opt-in OS-level confinement (macOS sandbox-exec): writes restricted to the
+// agent's cwd (+ ~/.claude state + temp). Default off.
+const AGENT_SANDBOX = process.env.TELEGRAM_AGENT_SANDBOX === '1'
 if (MULTI_SESSION) {
   initAgentRunner({
     stateDir: STATE_DIR,
@@ -95,9 +98,10 @@ if (MULTI_SESSION) {
     claudeBin: CLAUDE_BIN,
     permissionMode: AGENT_PERMISSION_MODE,
     model: AGENT_MODEL,
+    sandbox: AGENT_SANDBOX,
   })
   process.stderr.write(
-    `telegram daemon: multi-session ON (cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${CLAUDE_BIN}, stream=${AGENT_STREAM})\n`,
+    `telegram daemon: multi-session ON (cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${CLAUDE_BIN}, stream=${AGENT_STREAM}, sandbox=${AGENT_SANDBOX})\n`,
   )
 }
 

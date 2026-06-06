@@ -19,7 +19,8 @@
 
 import { spawn, type ChildProcess } from 'child_process'
 import { randomUUID } from 'crypto'
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
+import { mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'fs'
+import { homedir } from 'os'
 import { join } from 'path'
 
 export type AgentConfig = {
@@ -30,6 +31,8 @@ export type AgentConfig = {
   model?: string
   /** Hard cap on a single agent turn before the child is killed. */
   timeoutMs?: number
+  /** Wrap the agent in macOS sandbox-exec, confining writes to its cwd. */
+  sandbox?: boolean
 }
 
 type SessionRec = {
@@ -65,6 +68,29 @@ export function killAllAgents(): void {
     try { c.kill('SIGKILL') } catch {}
   }
   activeChildren.clear()
+}
+
+/** Optional OS-level confinement (macOS): allow writes only to the agent's cwd,
+ *  Claude Code's own state (~/.claude, needed for --resume), and temp. Defense
+ *  in depth on top of auto mode's project-scope rule. Opt-in via cfg.sandbox. */
+function wrapSandbox(cwd: string, args: string[]): [string, string[]] {
+  if (!cfg.sandbox) return [cfg.claudeBin, args]
+  let real = cwd
+  try { real = realpathSync(cwd) } catch {}
+  const home = homedir()
+  const profile = [
+    '(version 1)',
+    '(allow default)',
+    '(deny file-write*)',
+    '(allow file-write*',
+    `  (subpath "${real}")`,
+    `  (subpath "${home}/.claude")`,
+    '  (subpath "/private/var/folders")',
+    '  (subpath "/private/tmp")',
+    '  (subpath "/tmp")',
+    '  (subpath "/dev"))',
+  ].join('\n')
+  return ['sandbox-exec', ['-p', profile, cfg.claudeBin, ...args]]
 }
 
 export function topicKey(chatId: string, threadId: string | undefined): string {
@@ -234,7 +260,8 @@ function spawnClaude(
       activeChildren.delete(child)
       resolve(r)
     }
-    const child = spawn(cfg.claudeBin, args, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] })
+    const [bin, spawnArgs] = wrapSandbox(cwd, args)
+    const child = spawn(bin, spawnArgs, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] })
     activeChildren.add(child)
     let stdout = ''
     let stderr = ''
@@ -278,7 +305,8 @@ function spawnClaudeStream(
       activeChildren.delete(child)
       resolve({ code, result: result || acc, sessionId, stderr })
     }
-    const child = spawn(cfg.claudeBin, args, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] })
+    const [bin, spawnArgs] = wrapSandbox(cwd, args)
+    const child = spawn(bin, spawnArgs, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] })
     activeChildren.add(child)
     const timer = setTimeout(() => {
       try { child.kill('SIGKILL') } catch {}

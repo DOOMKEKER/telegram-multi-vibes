@@ -24,6 +24,10 @@ TELEGRAM_AGENT_MODEL=opus                      # auto mode requires a capable mo
 TELEGRAM_AGENT_CWD=/Users/you/agent-workspace # default working dir (NOT under ~/.claude)
 TELEGRAM_STREAM_EDIT_MS=600                    # live-edit throttle (~1s floor vs 429)
 
+# TELEGRAM_AGENT_SANDBOX=1   # optional: macOS sandbox-exec, confine writes to the
+                            # topic's cwd (+ ~/.claude + temp). Defense-in-depth
+                            # on top of auto mode. Experimental.
+
 # Voice (optional):
 WHISPER_MODEL=/Users/you/.claude/channels/telegram/models/ggml-large-v3-turbo-q5_0.bin
 # WHISPER_LANG=ru          # default: auto
