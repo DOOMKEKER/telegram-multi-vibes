@@ -574,26 +574,42 @@ async function streamAgentReply(
   const STREAM_CAP = 4000 // stay under the 4096 editMessageText limit while live
   let lastEdit = 0
   let lastShown = ''
-  const edit = async (text: string) => {
-    if (mid == null || !text) return
-    const body = text.length > STREAM_CAP ? text.slice(0, STREAM_CAP) + ' …' : text
+  let acc = ''     // streamed answer text so far
+  let status = ''  // current activity (💭 thinking / ⚙️ tool) during gaps
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const flush = () => {
+    timer = null
+    if (mid == null) return
+    // Show the answer text; while a tool/think runs with no new text, show the
+    // activity (appended after any text, or alone before the first token).
+    const base = acc ? (status ? `${acc}\n\n${status}` : acc) : (status || '⌛')
+    const body = base.length > STREAM_CAP ? base.slice(0, STREAM_CAP) + ' …' : base
     if (body === lastShown) return
+    lastEdit = Date.now()
     lastShown = body
-    await bot.api.editMessageText(chat_id, mid, body).catch(() => {}) // ignore "not modified"
+    bot.api.editMessageText(chat_id, mid, body).catch((e: unknown) => {
+      // Ignore "message is not modified" (400); back off on rate limit (429).
+      const ra = e instanceof GrammyError ? e.parameters?.retry_after : undefined
+      if (ra) {
+        lastEdit = Date.now() + ra * 1000
+        process.stderr.write(`telegram daemon: stream edit rate-limited, retry_after=${ra}s\n`)
+      }
+    })
   }
-  const onDelta = (acc: string) => {
-    const now = Date.now()
-    if (now - lastEdit < EDIT_MS) return
-    lastEdit = now
-    void edit(acc)
+  const schedule = () => {
+    if (timer) return // trailing-edge throttle: guarantees the latest state shows
+    timer = setTimeout(flush, Math.max(0, EDIT_MS - (Date.now() - lastEdit)))
   }
+  const onDelta = (a: string) => { acc = a; status = ''; schedule() }
+  const onStatus = (s: string) => { status = s; schedule() }
 
   let finalText: string
   try {
-    finalText = await runAgentTurn(chat_id, tkey, prompt, { onDelta })
+    finalText = await runAgentTurn(chat_id, tkey, prompt, { onDelta, onStatus })
   } catch (err) {
     finalText = `⚠️ agent error: ${err instanceof Error ? err.message : String(err)}`
   }
+  if (timer) clearTimeout(timer)
 
   const access = loadAccess()
   const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))

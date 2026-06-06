@@ -106,7 +106,7 @@ export function runAgentTurn(
   chatId: string,
   threadId: string | undefined,
   prompt: string,
-  opts?: { onDelta?: (accumulated: string) => void },
+  opts?: { onDelta?: (accumulated: string) => void; onStatus?: (status: string) => void },
 ): Promise<string> {
   const key = topicKey(chatId, threadId)
   const prev = queues.get(key) ?? Promise.resolve()
@@ -119,7 +119,7 @@ export function runAgentTurn(
 async function doTurn(
   key: string,
   prompt: string,
-  opts?: { onDelta?: (accumulated: string) => void },
+  opts?: { onDelta?: (accumulated: string) => void; onStatus?: (status: string) => void },
 ): Promise<string> {
   let rec = sessions.get(key)
   if (!rec) {
@@ -152,6 +152,7 @@ async function doTurn(
       rec.cwd,
       prompt,
       opts!.onDelta!,
+      opts?.onStatus,
     )
     code = r.code
     stderr = r.stderr
@@ -230,6 +231,7 @@ function spawnClaudeStream(
   cwd: string,
   prompt: string,
   onDelta: (accumulated: string) => void,
+  onStatus?: (status: string) => void,
 ): Promise<{ code: number; result: string; sessionId: string; stderr: string }> {
   return new Promise(resolve => {
     let done = false
@@ -269,6 +271,11 @@ function spawnClaudeStream(
         ) {
           acc += o.event.delta.text
           try { onDelta(acc) } catch {}
+        } else if (o.type === 'stream_event' && o.event?.type === 'content_block_start' && o.event.content_block) {
+          // Surface progress during gaps where no text streams (thinking / tools).
+          const cb = o.event.content_block
+          if (cb.type === 'tool_use' && onStatus) { try { onStatus(`⚙️ ${cb.name ?? 'tool'}…`) } catch {} }
+          else if (cb.type === 'thinking' && onStatus) { try { onStatus('💭 думаю…') } catch {} }
         } else if (o.type === 'result') {
           if (typeof o.result === 'string') result = o.result
           if (typeof o.session_id === 'string') sessionId = o.session_id
