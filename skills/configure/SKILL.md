@@ -1,12 +1,15 @@
 ---
 name: configure
-description: Set up the Telegram channel — save the bot token and review access policy. Use when the user pastes a Telegram bot token, asks to configure Telegram, asks "how do I set this up" or "who can reach me," or wants to check channel status.
+description: Set up the Telegram channel — save the bot token, choose the voice-transcription (Whisper) model, and review access policy. Use when the user pastes a Telegram bot token, asks to configure Telegram, asks "how do I set this up" / "who can reach me", wants to pick or download a Whisper model for voice messages, or wants to check channel status.
 user-invocable: true
 allowed-tools:
   - Read
   - Write
   - Bash(ls *)
   - Bash(mkdir *)
+  - Bash(curl *)
+  - Bash(test *)
+  - Bash(which *)
 ---
 
 # /telegram:configure — Telegram Channel Setup
@@ -34,7 +37,12 @@ Read both state files and give the user a complete picture:
    - Allowed senders: count, and list display names or IDs
    - Pending pairings: count, with codes and display names if any
 
-3. **What next** — end with a concrete next step based on state:
+3. **Voice** — report whether voice transcription is enabled: check `WHISPER_MODEL`
+   in `.env`, and whether `whisper-cli` and `ffmpeg` are on PATH (`which`). Show
+   on/off and which model. If off, mention `/telegram:configure model <name>` to
+   pick and download a model.
+
+4. **What next** — end with a concrete next step based on state:
    - No token → *"Run `/telegram:configure <token>` with the token from
      BotFather."*
    - Token set, policy is pairing, nobody allowed → *"DM your bot on
@@ -79,6 +87,41 @@ offer.
    preserve other keys. Write back, no quotes around the value.
 4. `chmod 600 ~/.claude/channels/telegram/.env` — the token is a credential.
 5. Confirm, then show the no-args status so the user sees where they stand.
+
+### `model [name]` — choose / download the voice-transcription model
+
+Voice messages are transcribed locally with [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
+(audio never leaves the machine, no API key). This picks the model and writes
+`WHISPER_MODEL` to `.env`.
+
+**Curated models** (whisper.cpp GGUF, from `huggingface.co/ggerganov/whisper.cpp`):
+
+| name | file | size | notes |
+| --- | --- | --- | --- |
+| `turbo` | `ggml-large-v3-turbo.bin` | ~1.6 GB | best quality, fast on Apple Silicon (**recommended**) |
+| `turbo-q5` | `ggml-large-v3-turbo-q5_0.bin` | ~574 MB | smaller, slightly lower quality |
+| `medium` | `ggml-medium.bin` | ~1.5 GB | older multilingual |
+| `small` | `ggml-small.bin` | ~488 MB | faster, lower quality |
+| `base` | `ggml-base.bin` | ~148 MB | fastest, basic quality |
+
+Base URL: `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/<file>`
+
+**No name** — list the table above and show the current `WHISPER_MODEL` (if set).
+
+**`<name>`** — set it up:
+
+1. Map `<name>` to its file via the table. If unknown, show the table and stop.
+2. Check deps: `which whisper-cli` and `which ffmpeg`. If either is missing, tell
+   the user to run `brew install whisper-cpp ffmpeg` first, then re-run this.
+3. `mkdir -p ~/.claude/channels/telegram/models`.
+4. If the file already exists (`test -f`), skip the download. Otherwise download
+   it (warn it's a large file): `curl -fL -o ~/.claude/channels/telegram/models/<file> <url>`.
+5. Read existing `.env`; set/replace `WHISPER_MODEL=` with the absolute path
+   `~/.claude/channels/telegram/models/<file>` (preserve other keys, no quotes).
+   `chmod 600` the file.
+6. Optional: mention `WHISPER_LANG` (default `auto`; e.g. `ru` to force Russian)
+   and `TELEGRAM_VOICE_KEEP=1` (keep the OGG recordings instead of deleting them).
+7. Say the daemon must be restarted to pick up the new model.
 
 ### `clear` — remove the token
 

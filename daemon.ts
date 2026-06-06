@@ -36,6 +36,10 @@ import { randomBytes } from 'crypto'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { initAgentRunner, runAgentTurn } from './agent-runner'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
+import telegramify from 'telegramify-markdown'
+const execFileP = promisify(execFile)
 
 // ---- Paths & env -----------------------------------------------------------
 
@@ -80,6 +84,9 @@ const AGENT_CWD = process.env.TELEGRAM_AGENT_CWD ?? join(homedir(), 'telegram-ag
 const AGENT_PERMISSION_MODE = process.env.TELEGRAM_AGENT_PERMISSION_MODE ?? 'acceptEdits'
 const AGENT_MODEL = process.env.TELEGRAM_AGENT_MODEL
 const CLAUDE_BIN = process.env.TELEGRAM_CLAUDE_BIN ?? 'claude'
+// Stream the agent's reply into one message (placeholder → live edits). On by
+// default; set TELEGRAM_AGENT_STREAM=0 for a single final message instead.
+const AGENT_STREAM = process.env.TELEGRAM_AGENT_STREAM !== '0'
 if (MULTI_SESSION) {
   initAgentRunner({
     stateDir: STATE_DIR,
@@ -89,7 +96,7 @@ if (MULTI_SESSION) {
     model: AGENT_MODEL,
   })
   process.stderr.write(
-    `telegram daemon: multi-session ON (cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${CLAUDE_BIN})\n`,
+    `telegram daemon: multi-session ON (cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${CLAUDE_BIN}, stream=${AGENT_STREAM})\n`,
   )
 }
 
@@ -279,6 +286,53 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// Local speech-to-text via whisper.cpp. Audio never leaves the machine; no API
+// key. Returns the transcript, or undefined to fall back to the placeholder +
+// attachment behaviour (e.g. WHISPER_MODEL unset / binary missing / failure).
+async function transcribeAudio(file_id: string): Promise<string | undefined> {
+  const model = process.env.WHISPER_MODEL
+  if (!model || !existsSync(model)) return undefined
+  const whisperBin = process.env.WHISPER_CLI ?? 'whisper-cli'
+  const ffmpegBin = process.env.FFMPEG ?? 'ffmpeg'
+  const lang = process.env.WHISPER_LANG ?? 'auto'
+  try {
+    const file = await bot.api.getFile(file_id)
+    if (!file.file_path) return undefined
+    const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`)
+    if (!res.ok) return undefined
+    const buf = Buffer.from(await res.arrayBuffer())
+    mkdirSync(INBOX_DIR, { recursive: true })
+    const uniq = (file.file_unique_id ?? 'dl').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+    const base = join(INBOX_DIR, `${Date.now()}-${uniq}`)
+    const ogg = `${base}.ogg`
+    const wav = `${base}.wav`
+    writeFileSync(ogg, buf)
+    // whisper-cli wants 16 kHz mono WAV; Telegram sends OGG/Opus.
+    await execFileP(ffmpegBin, ['-y', '-i', ogg, '-ar', '16000', '-ac', '1', wav])
+    const { stdout } = await execFileP(
+      whisperBin,
+      ['-m', model, '-f', wav, '-l', lang, '-nt', '-np'],
+      { maxBuffer: 10 * 1024 * 1024 },
+    )
+    // Privacy/disk: drop recordings once transcribed. WAV (derived temp) is
+    // always removed; OGG is removed too unless TELEGRAM_VOICE_KEEP=1.
+    try { unlinkSync(wav) } catch {}
+    if (process.env.TELEGRAM_VOICE_KEEP !== '1') { try { unlinkSync(ogg) } catch {} }
+    const txt = stdout
+      .replace(/\r/g, '')
+      .split('\n')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .join(' ')
+      .trim()
+    return txt || undefined
+  } catch (e) {
+    // On failure leave the audio in the inbox for debugging.
+    process.stderr.write(`telegram daemon: transcribe failed (audio kept in inbox): ${e}\n`)
+    return undefined
+  }
+}
+
 function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[] {
   if (text.length <= limit) return [text]
   if (mode === 'length') {
@@ -446,16 +500,39 @@ function broadcastNotification(method: string, params: unknown, route?: { chat_i
 
 /** Send an agent's reply back into a topic, chunked and threaded like the reply
  *  tool. Used by the multi-session path. */
+/** Convert assistant Markdown to Telegram MarkdownV2 (escaped). null on failure. */
+function tgMarkdown(text: string): string | null {
+  try {
+    const out = telegramify(text, 'escape')
+    return typeof out === 'string' && out.length > 0 ? out : null
+  } catch {
+    return null
+  }
+}
+
 async function sendAgentReply(
   chat_id: string,
   threadId: number | undefined,
   text: string,
   replyTo: number | undefined,
 ): Promise<void> {
+  const tid = effectiveSendThreadId(threadId)
+  const baseOpts = {
+    ...(replyTo != null ? { reply_parameters: { message_id: replyTo } } : {}),
+    ...(tid != null ? { message_thread_id: tid } : {}),
+  }
+  // Prefer a single MarkdownV2 message so formatting renders; fall back to plain.
+  const md = tgMarkdown(text)
+  if (md != null && md.length <= MAX_CHUNK_LIMIT) {
+    const ok = await bot.api
+      .sendMessage(chat_id, md, { ...baseOpts, parse_mode: 'MarkdownV2' })
+      .then(() => true)
+      .catch(() => false)
+    if (ok) return
+  }
   const access = loadAccess()
   const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
   const mode = access.chunkMode ?? 'length'
-  const tid = effectiveSendThreadId(threadId)
   const chunks = chunk(text, limit, mode)
   for (let i = 0; i < chunks.length; i++) {
     await bot.api
@@ -463,6 +540,83 @@ async function sendAgentReply(
         ...(i === 0 && replyTo != null ? { reply_parameters: { message_id: replyTo } } : {}),
         ...(tid != null ? { message_thread_id: tid } : {}),
       })
+      .catch(e => process.stderr.write(`telegram daemon: agent reply send failed: ${e}\n`))
+  }
+}
+
+/** Stream an agent's reply into a single Telegram message: send a ⌛ placeholder,
+ *  edit it (throttled) as text streams in, then render the final result —
+ *  chunking the overflow into follow-up messages. */
+async function streamAgentReply(
+  chat_id: string,
+  threadId: number | undefined,
+  tkey: string | undefined,
+  prompt: string,
+  replyTo: number | undefined,
+): Promise<void> {
+  const tid = effectiveSendThreadId(threadId)
+  const baseOpts = {
+    ...(replyTo != null ? { reply_parameters: { message_id: replyTo } } : {}),
+    ...(tid != null ? { message_thread_id: tid } : {}),
+  }
+  let mid: number | undefined
+  try {
+    const ph = await bot.api.sendMessage(chat_id, '⌛', baseOpts)
+    mid = ph.message_id
+  } catch (e) {
+    process.stderr.write(`telegram daemon: placeholder send failed: ${e}\n`)
+  }
+
+  // Throttle live edits. ~1s is the safe floor for editing one message; below
+  // that Telegram starts returning 429. Configurable via TELEGRAM_STREAM_EDIT_MS.
+  const EDIT_MS = Math.max(500, Number(process.env.TELEGRAM_STREAM_EDIT_MS) || 1000)
+  const STREAM_CAP = 4000 // stay under the 4096 editMessageText limit while live
+  let lastEdit = 0
+  let lastShown = ''
+  const edit = async (text: string) => {
+    if (mid == null || !text) return
+    const body = text.length > STREAM_CAP ? text.slice(0, STREAM_CAP) + ' …' : text
+    if (body === lastShown) return
+    lastShown = body
+    await bot.api.editMessageText(chat_id, mid, body).catch(() => {}) // ignore "not modified"
+  }
+  const onDelta = (acc: string) => {
+    const now = Date.now()
+    if (now - lastEdit < EDIT_MS) return
+    lastEdit = now
+    void edit(acc)
+  }
+
+  let finalText: string
+  try {
+    finalText = await runAgentTurn(chat_id, tkey, prompt, { onDelta })
+  } catch (err) {
+    finalText = `⚠️ agent error: ${err instanceof Error ? err.message : String(err)}`
+  }
+
+  const access = loadAccess()
+  const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+  const mode = access.chunkMode ?? 'length'
+  const body = finalText || '(empty)'
+
+  // Final render: prefer a single MarkdownV2 message so formatting renders;
+  // fall back to plain, chunked, on conversion/length/API failure.
+  const md = tgMarkdown(body)
+  if (md != null && md.length <= MAX_CHUNK_LIMIT) {
+    const ok = mid != null
+      ? await bot.api.editMessageText(chat_id, mid, md, { parse_mode: 'MarkdownV2' }).then(() => true).catch(() => false)
+      : await bot.api.sendMessage(chat_id, md, { ...baseOpts, parse_mode: 'MarkdownV2' }).then(() => true).catch(() => false)
+    if (ok) return
+  }
+  const chunks = chunk(body, limit, mode)
+  if (mid != null) {
+    await bot.api.editMessageText(chat_id, mid, chunks[0]).catch(() => {})
+  } else {
+    await bot.api.sendMessage(chat_id, chunks[0], baseOpts).catch(() => {})
+  }
+  for (let i = 1; i < chunks.length; i++) {
+    await bot.api
+      .sendMessage(chat_id, chunks[i], tid != null ? { message_thread_id: tid } : {})
       .catch(e => process.stderr.write(`telegram daemon: agent reply send failed: ${e}\n`))
   }
 }
@@ -673,6 +827,7 @@ async function handleInbound(
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
+  transcribe?: () => Promise<string | undefined>,
 ): Promise<void> {
   const result = gate(ctx)
   if (result.action === 'drop') return
@@ -727,21 +882,47 @@ async function handleInbound(
       .catch(() => {})
   }
 
+  // Voice/audio: transcribe locally (whisper.cpp) so the recognized speech
+  // becomes the message text for BOTH the agent path and the MCP broadcast.
+  // Runs before the multi-session branch so the agent gets the transcript, not
+  // the "(voice message)" placeholder. Echoes 🎤«…» so the user sees what was
+  // recognized. Falls back to placeholder + attachment if transcription is off.
+  let content = text
+  let attach = attachment
+  if (transcribe) {
+    const t = await transcribe()
+    if (t) {
+      content = t
+      attach = undefined
+      const echoTid = effectiveSendThreadId(threadId)
+      // Await so the 🎤 echo lands BEFORE the agent's reply/placeholder.
+      await bot.api
+        .sendMessage(chat_id, `🎤 «${content}»`, echoTid != null ? { message_thread_id: echoTid } : {})
+        .catch(() => {})
+    }
+  }
+
   // Multi-session: hand the message to this topic's own Claude agent and reply
   // back into the same topic. (Phase 1 ignores images/attachments — text only.)
   if (MULTI_SESSION) {
     const tkey = threadId != null ? String(threadId) : undefined
-    void runAgentTurn(chat_id, tkey, text)
-      .then(reply => sendAgentReply(chat_id, threadId, reply, msgId))
-      .catch(err => {
-        process.stderr.write(`telegram daemon: agent turn failed: ${err}\n`)
-        return sendAgentReply(
-          chat_id,
-          threadId,
-          `⚠️ agent error: ${err instanceof Error ? err.message : String(err)}`,
-          msgId,
-        )
+    if (AGENT_STREAM) {
+      void streamAgentReply(chat_id, threadId, tkey, content, msgId).catch(err => {
+        process.stderr.write(`telegram daemon: agent stream failed: ${err}\n`)
       })
+    } else {
+      void runAgentTurn(chat_id, tkey, content)
+        .then(reply => sendAgentReply(chat_id, threadId, reply, msgId))
+        .catch(err => {
+          process.stderr.write(`telegram daemon: agent turn failed: ${err}\n`)
+          return sendAgentReply(
+            chat_id,
+            threadId,
+            `⚠️ agent error: ${err instanceof Error ? err.message : String(err)}`,
+            msgId,
+          )
+        })
+    }
     return
   }
 
@@ -750,7 +931,7 @@ async function handleInbound(
   broadcastNotification(
     'notifications/claude/channel',
     {
-      content: text,
+      content,
       meta: {
         chat_id,
         ...(msgId != null ? { message_id: String(msgId) } : {}),
@@ -759,12 +940,12 @@ async function handleInbound(
         user_id: String(from.id),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
         ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
+        ...(attach ? {
+          attachment_kind: attach.kind,
+          attachment_file_id: attach.file_id,
+          ...(attach.size != null ? { attachment_size: String(attach.size) } : {}),
+          ...(attach.mime ? { attachment_mime: attach.mime } : {}),
+          ...(attach.name ? { attachment_name: attach.name } : {}),
         } : {}),
       },
     },
@@ -918,7 +1099,7 @@ bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
   await handleInbound(ctx, ctx.message.caption ?? '(voice message)', undefined, {
     kind: 'voice', file_id: voice.file_id, size: voice.file_size, mime: voice.mime_type,
-  })
+  }, () => transcribeAudio(voice.file_id))
 })
 
 bot.on('message:audio', async ctx => {
@@ -926,7 +1107,7 @@ bot.on('message:audio', async ctx => {
   const name = safeName(audio.file_name)
   await handleInbound(ctx, ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`, undefined, {
     kind: 'audio', file_id: audio.file_id, size: audio.file_size, mime: audio.mime_type, name,
-  })
+  }, () => transcribeAudio(audio.file_id))
 })
 
 bot.on('message:video', async ctx => {
@@ -940,7 +1121,7 @@ bot.on('message:video_note', async ctx => {
   const vn = ctx.message.video_note
   await handleInbound(ctx, '(video note)', undefined, {
     kind: 'video_note', file_id: vn.file_id, size: vn.file_size,
-  })
+  }, () => transcribeAudio(vn.file_id))
 })
 
 bot.on('message:sticker', async ctx => {

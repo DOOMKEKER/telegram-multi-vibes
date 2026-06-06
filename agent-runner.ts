@@ -42,9 +42,12 @@ type SessionRec = {
 }
 
 const APPEND_SYSTEM_PROMPT =
-  'You are answering a user through a Telegram chat. Keep replies concise and in ' +
-  'plain text suitable for a messenger (no huge dumps). The user sees only your ' +
-  'final message — your tool output and intermediate steps are not shown to them.'
+  'You are replying to a user inside a Telegram chat (not a terminal). Keep replies ' +
+  'short and conversational. Telegram renders only light Markdown — bold, italic, ' +
+  'inline code, fenced ``` code blocks, links, and simple bullet lists. Do NOT use ' +
+  'Markdown tables, ASCII tables, or long ATX headings (#) — they do not render well. ' +
+  'The user sees only your final message; your tool calls and intermediate steps are ' +
+  'not shown to them.'
 
 let cfg: AgentConfig
 let SESSIONS_FILE = ''
@@ -88,16 +91,25 @@ export function initAgentRunner(c: AgentConfig): void {
 }
 
 /** Run one agent turn for a topic. Serialized per topic. Resolves to reply text. */
-export function runAgentTurn(chatId: string, threadId: string | undefined, prompt: string): Promise<string> {
+export function runAgentTurn(
+  chatId: string,
+  threadId: string | undefined,
+  prompt: string,
+  opts?: { onDelta?: (accumulated: string) => void },
+): Promise<string> {
   const key = topicKey(chatId, threadId)
   const prev = queues.get(key) ?? Promise.resolve()
-  const next = prev.catch(() => {}).then(() => doTurn(key, prompt))
+  const next = prev.catch(() => {}).then(() => doTurn(key, prompt, opts))
   // Keep the chain alive even if this turn rejects, so the next message still runs.
   queues.set(key, next.catch(() => {}))
   return next
 }
 
-async function doTurn(key: string, prompt: string): Promise<string> {
+async function doTurn(
+  key: string,
+  prompt: string,
+  opts?: { onDelta?: (accumulated: string) => void },
+): Promise<string> {
   let rec = sessions.get(key)
   if (!rec) {
     rec = {
@@ -111,14 +123,41 @@ async function doTurn(key: string, prompt: string): Promise<string> {
     saveSessions()
   }
 
-  const args = ['-p', '--output-format', 'json', '--permission-mode', cfg.permissionMode]
-  args.push('--append-system-prompt', APPEND_SYSTEM_PROMPT)
+  const stream = !!opts?.onDelta
+  const args = ['-p', '--permission-mode', cfg.permissionMode, '--append-system-prompt', APPEND_SYSTEM_PROMPT]
   if (cfg.model) args.push('--model', cfg.model)
   if (rec.started) args.push('--resume', rec.sessionId)
   else args.push('--session-id', rec.sessionId)
 
-  log(`turn key=${key} session=${rec.sessionId} ${rec.started ? 'resume' : 'new'} cwd=${rec.cwd}`)
-  const { code, stdout, stderr } = await spawnClaude(args, rec.cwd, prompt)
+  log(`turn key=${key} session=${rec.sessionId} ${rec.started ? 'resume' : 'new'} ${stream ? 'stream' : 'json'} cwd=${rec.cwd}`)
+
+  let code = 0
+  let stderr = ''
+  let result = ''
+  let newSessionId = ''
+  if (stream) {
+    const r = await spawnClaudeStream(
+      [...args, '--output-format', 'stream-json', '--verbose', '--include-partial-messages'],
+      rec.cwd,
+      prompt,
+      opts!.onDelta!,
+    )
+    code = r.code
+    stderr = r.stderr
+    result = r.result
+    newSessionId = r.sessionId
+  } else {
+    const r = await spawnClaude([...args, '--output-format', 'json'], rec.cwd, prompt)
+    code = r.code
+    stderr = r.stderr
+    try {
+      const parsed = JSON.parse(r.stdout) as { result?: unknown; session_id?: unknown }
+      result = typeof parsed.result === 'string' ? parsed.result : r.stdout
+      if (typeof parsed.session_id === 'string') newSessionId = parsed.session_id
+    } catch {
+      result = r.stdout.trim()
+    }
+  }
 
   if (code !== 0) {
     log(`claude exited ${code}: ${stderr.slice(0, 800)}`)
@@ -131,15 +170,7 @@ async function doTurn(key: string, prompt: string): Promise<string> {
     throw new Error(`agent failed (exit ${code})${stderr ? `: ${stderr.slice(0, 200)}` : ''}`)
   }
 
-  let result = ''
-  try {
-    const parsed = JSON.parse(stdout) as { result?: unknown; session_id?: unknown }
-    result = typeof parsed.result === 'string' ? parsed.result : stdout
-    if (typeof parsed.session_id === 'string' && parsed.session_id) rec.sessionId = parsed.session_id
-  } catch {
-    result = stdout.trim()
-  }
-
+  if (newSessionId) rec.sessionId = newSessionId
   rec.started = true
   rec.lastActivity = Date.now()
   saveSessions()
@@ -175,6 +206,71 @@ function spawnClaude(
       child.stdin.end()
     } catch (err) {
       finish({ code: -1, stdout, stderr: `stdin write failed: ${err}` })
+    }
+  })
+}
+
+// Streaming variant: parse NDJSON stream-json events, surface text deltas via
+// onDelta(accumulatedText), and resolve with the final result text + session id.
+function spawnClaudeStream(
+  args: string[],
+  cwd: string,
+  prompt: string,
+  onDelta: (accumulated: string) => void,
+): Promise<{ code: number; result: string; sessionId: string; stderr: string }> {
+  return new Promise(resolve => {
+    let done = false
+    let buf = ''
+    let stderr = ''
+    let acc = ''
+    let result = ''
+    let sessionId = ''
+    const finish = (code: number) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resolve({ code, result: result || acc, sessionId, stderr })
+    }
+    const child = spawn(cfg.claudeBin, args, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] })
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL') } catch {}
+      finish(-2)
+    }, cfg.timeoutMs)
+    child.stdout.on('data', d => {
+      buf += d.toString('utf8')
+      let nl = buf.indexOf('\n')
+      while (nl !== -1) {
+        const line = buf.slice(0, nl).trim()
+        buf = buf.slice(nl + 1)
+        nl = buf.indexOf('\n')
+        if (!line) continue
+        let o: any
+        try { o = JSON.parse(line) } catch { continue }
+        if (
+          o.type === 'stream_event' &&
+          o.event?.type === 'content_block_delta' &&
+          o.event?.delta?.type === 'text_delta' &&
+          typeof o.event.delta.text === 'string'
+        ) {
+          acc += o.event.delta.text
+          try { onDelta(acc) } catch {}
+        } else if (o.type === 'result') {
+          if (typeof o.result === 'string') result = o.result
+          if (typeof o.session_id === 'string') sessionId = o.session_id
+        } else if (typeof o.session_id === 'string' && !sessionId) {
+          sessionId = o.session_id
+        }
+      }
+    })
+    child.stderr.on('data', d => { stderr += d.toString('utf8') })
+    child.on('error', err => { stderr += `\n${err}`; finish(-1) })
+    child.on('close', code => finish(code ?? -1))
+    try {
+      child.stdin.write(prompt)
+      child.stdin.end()
+    } catch (err) {
+      stderr += `stdin write failed: ${err}`
+      finish(-1)
     }
   })
 }
