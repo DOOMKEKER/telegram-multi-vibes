@@ -35,6 +35,7 @@ import { join } from 'path'
 import { randomBytes } from 'crypto'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
+import { initAgentRunner, runAgentTurn } from './agent-runner'
 
 // ---- Paths & env -----------------------------------------------------------
 
@@ -67,6 +68,29 @@ if (!TOKEN) {
     `  format: TELEGRAM_BOT_TOKEN=123456789:AAH...\n`,
   )
   process.exit(1)
+}
+
+// ---- Multi-session (one Claude agent per topic) ---------------------------
+// When on, delivered messages are handed to a per-topic `claude -p --resume`
+// agent instead of being broadcast to MCP clients. See docs/DESIGN-multisession.md.
+const MULTI_SESSION = process.env.TELEGRAM_MULTI_SESSION === '1'
+// NB: must live OUTSIDE ~/.claude — Claude Code blocks writes to its own config
+// dir as "sensitive", so an agent cwd inside STATE_DIR can't create files.
+const AGENT_CWD = process.env.TELEGRAM_AGENT_CWD ?? join(homedir(), 'telegram-agent-workspace')
+const AGENT_PERMISSION_MODE = process.env.TELEGRAM_AGENT_PERMISSION_MODE ?? 'acceptEdits'
+const AGENT_MODEL = process.env.TELEGRAM_AGENT_MODEL
+const CLAUDE_BIN = process.env.TELEGRAM_CLAUDE_BIN ?? 'claude'
+if (MULTI_SESSION) {
+  initAgentRunner({
+    stateDir: STATE_DIR,
+    cwd: AGENT_CWD,
+    claudeBin: CLAUDE_BIN,
+    permissionMode: AGENT_PERMISSION_MODE,
+    model: AGENT_MODEL,
+  })
+  process.stderr.write(
+    `telegram daemon: multi-session ON (cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${CLAUDE_BIN})\n`,
+  )
 }
 
 // ---- Wire protocol shared with server.ts (the MCP client) ------------------
@@ -420,6 +444,29 @@ function broadcastNotification(method: string, params: unknown, route?: { chat_i
   }
 }
 
+/** Send an agent's reply back into a topic, chunked and threaded like the reply
+ *  tool. Used by the multi-session path. */
+async function sendAgentReply(
+  chat_id: string,
+  threadId: number | undefined,
+  text: string,
+  replyTo: number | undefined,
+): Promise<void> {
+  const access = loadAccess()
+  const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+  const mode = access.chunkMode ?? 'length'
+  const tid = effectiveSendThreadId(threadId)
+  const chunks = chunk(text, limit, mode)
+  for (let i = 0; i < chunks.length; i++) {
+    await bot.api
+      .sendMessage(chat_id, chunks[i], {
+        ...(i === 0 && replyTo != null ? { reply_parameters: { message_id: replyTo } } : {}),
+        ...(tid != null ? { message_thread_id: tid } : {}),
+      })
+      .catch(e => process.stderr.write(`telegram daemon: agent reply send failed: ${e}\n`))
+  }
+}
+
 // ---- Permission-request tracking ------------------------------------------
 
 type PendingPerm = {
@@ -678,6 +725,24 @@ async function handleInbound(
         { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
       ])
       .catch(() => {})
+  }
+
+  // Multi-session: hand the message to this topic's own Claude agent and reply
+  // back into the same topic. (Phase 1 ignores images/attachments — text only.)
+  if (MULTI_SESSION) {
+    const tkey = threadId != null ? String(threadId) : undefined
+    void runAgentTurn(chat_id, tkey, text)
+      .then(reply => sendAgentReply(chat_id, threadId, reply, msgId))
+      .catch(err => {
+        process.stderr.write(`telegram daemon: agent turn failed: ${err}\n`)
+        return sendAgentReply(
+          chat_id,
+          threadId,
+          `⚠️ agent error: ${err instanceof Error ? err.message : String(err)}`,
+          msgId,
+        )
+      })
+    return
   }
 
   const imagePath = downloadImage ? await downloadImage() : undefined
