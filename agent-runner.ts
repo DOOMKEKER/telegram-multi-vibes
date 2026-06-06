@@ -17,7 +17,7 @@
  * docs/DESIGN-multisession.md for the warm-session upgrade path.
  */
 
-import { spawn } from 'child_process'
+import { spawn, type ChildProcess } from 'child_process'
 import { randomUUID } from 'crypto'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { join } from 'path'
@@ -53,6 +53,17 @@ let cfg: AgentConfig
 let SESSIONS_FILE = ''
 const sessions = new Map<string, SessionRec>()
 const queues = new Map<string, Promise<unknown>>()
+const activeChildren = new Set<ChildProcess>()
+
+/** Kill all in-flight agent subprocesses. Called on daemon shutdown so a restart
+ *  never orphans `claude -p` children that would keep --resuming a session and
+ *  collide with the next daemon's turns on the same topic. */
+export function killAllAgents(): void {
+  for (const c of activeChildren) {
+    try { c.kill('SIGKILL') } catch {}
+  }
+  activeChildren.clear()
+}
 
 export function topicKey(chatId: string, threadId: string | undefined): string {
   return `${chatId}:${threadId ?? ''}`
@@ -188,9 +199,11 @@ function spawnClaude(
       if (done) return
       done = true
       clearTimeout(timer)
+      activeChildren.delete(child)
       resolve(r)
     }
     const child = spawn(cfg.claudeBin, args, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] })
+    activeChildren.add(child)
     let stdout = ''
     let stderr = ''
     const timer = setTimeout(() => {
@@ -229,9 +242,11 @@ function spawnClaudeStream(
       if (done) return
       done = true
       clearTimeout(timer)
+      activeChildren.delete(child)
       resolve({ code, result: result || acc, sessionId, stderr })
     }
     const child = spawn(cfg.claudeBin, args, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] })
+    activeChildren.add(child)
     const timer = setTimeout(() => {
       try { child.kill('SIGKILL') } catch {}
       finish(-2)

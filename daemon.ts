@@ -35,7 +35,7 @@ import { join } from 'path'
 import { randomBytes } from 'crypto'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { initAgentRunner, runAgentTurn } from './agent-runner'
+import { initAgentRunner, runAgentTurn, killAllAgents } from './agent-runner'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import telegramify from 'telegramify-markdown'
@@ -148,6 +148,7 @@ let shuttingDown = false
 
 function shutdown(code: number): never {
   shuttingDown = true
+  try { killAllAgents() } catch {}
   try { ipcServer.close() } catch {}
   try { unlinkSync(SOCKET_PATH) } catch {}
   try { void bot.stop() } catch {}
