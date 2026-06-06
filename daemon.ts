@@ -36,7 +36,7 @@ import { join } from 'path'
 import { randomBytes } from 'crypto'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { initAgentRunner, runAgentTurn, killAllAgents, setTopicCwd, getTopicCwd } from './agent-runner'
+import { initAgentRunner, runAgentTurn, killAllAgents, setTopicCwd, getTopicCwd, stopTopic } from './agent-runner'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import telegramify from 'telegramify-markdown'
@@ -566,8 +566,9 @@ async function streamAgentReply(
     ...(tid != null ? { message_thread_id: tid } : {}),
   }
   let mid: number | undefined
+  const stopKb = new InlineKeyboard().text('⏹ Стоп', `stop:${chat_id}:${tkey ?? ''}`)
   try {
-    const ph = await bot.api.sendMessage(chat_id, '⌛', baseOpts)
+    const ph = await bot.api.sendMessage(chat_id, '⌛', { ...baseOpts, reply_markup: stopKb })
     mid = ph.message_id
   } catch (e) {
     process.stderr.write(`telegram daemon: placeholder send failed: ${e}\n`)
@@ -592,7 +593,7 @@ async function streamAgentReply(
     if (body === lastShown) return
     lastEdit = Date.now()
     lastShown = body
-    bot.api.editMessageText(chat_id, mid, body).catch((e: unknown) => {
+    bot.api.editMessageText(chat_id, mid, body, { reply_markup: stopKb }).catch((e: unknown) => {
       // Ignore "message is not modified" (400); back off on rate limit (429).
       const ra = e instanceof GrammyError ? e.parameters?.retry_after : undefined
       if (ra) {
@@ -1058,6 +1059,18 @@ bot.command('status', async ctx => {
 // resolution back to the originating client.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+  // ⏹ Stop button on a streaming agent message: kill that topic's agent turn.
+  const stopM = /^stop:([^:]*):(.*)$/.exec(data)
+  if (stopM) {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const ok = stopTopic(stopM[1], stopM[2] || undefined)
+    await ctx.answerCallbackQuery({ text: ok ? '⏹ Останавливаю…' : 'Уже завершено' }).catch(() => {})
+    return
+  }
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
     await ctx.answerCallbackQuery().catch(() => {})

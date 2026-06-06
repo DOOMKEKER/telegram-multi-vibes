@@ -59,6 +59,8 @@ let SESSIONS_FILE = ''
 const sessions = new Map<string, SessionRec>()
 const queues = new Map<string, Promise<unknown>>()
 const activeChildren = new Set<ChildProcess>()
+const running = new Map<string, ChildProcess>() // topic key -> current in-flight child
+const stopped = new Set<string>() // topics the user asked to stop mid-turn
 
 /** Kill all in-flight agent subprocesses. Called on daemon shutdown so a restart
  *  never orphans `claude -p` children that would keep --resuming a session and
@@ -68,6 +70,17 @@ export function killAllAgents(): void {
     try { c.kill('SIGKILL') } catch {}
   }
   activeChildren.clear()
+}
+
+/** Stop the in-flight agent turn for a topic (user pressed ⏹ Stop). Marks it as
+ *  a deliberate stop so the turn ends with a "stopped" notice, not an error. */
+export function stopTopic(chatId: string, threadId: string | undefined): boolean {
+  const key = topicKey(chatId, threadId)
+  const c = running.get(key)
+  if (!c) return false
+  stopped.add(key)
+  try { c.kill('SIGKILL') } catch {}
+  return true
 }
 
 /** Optional OS-level confinement (macOS): allow writes only to the agent's cwd,
@@ -193,6 +206,7 @@ async function doTurn(
   let stderr = ''
   let result = ''
   let newSessionId = ''
+  const onChild = (c: ChildProcess) => running.set(key, c)
   if (stream) {
     const r = await spawnClaudeStream(
       [...args, '--output-format', 'stream-json', '--verbose', '--include-partial-messages'],
@@ -200,13 +214,14 @@ async function doTurn(
       prompt,
       opts!.onDelta!,
       opts?.onStatus,
+      onChild,
     )
     code = r.code
     stderr = r.stderr
     result = r.result
     newSessionId = r.sessionId
   } else {
-    const r = await spawnClaude([...args, '--output-format', 'json'], rec.cwd, prompt)
+    const r = await spawnClaude([...args, '--output-format', 'json'], rec.cwd, prompt, onChild)
     code = r.code
     stderr = r.stderr
     try {
@@ -216,6 +231,16 @@ async function doTurn(
     } catch {
       result = r.stdout.trim()
     }
+  }
+
+  running.delete(key)
+
+  // User pressed ⏹ Stop — end cleanly, not as a failure.
+  if (stopped.has(key)) {
+    stopped.delete(key)
+    if (!rec.started) sessions.delete(key) // killed a fresh session → start clean next time
+    saveSessions()
+    return '⏹ Остановлено.'
   }
 
   if (code !== 0) {
@@ -250,6 +275,7 @@ function spawnClaude(
   args: string[],
   cwd: string,
   prompt: string,
+  onChild?: (c: ChildProcess) => void,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise(resolve => {
     let done = false
@@ -263,6 +289,7 @@ function spawnClaude(
     const [bin, spawnArgs] = wrapSandbox(cwd, args)
     const child = spawn(bin, spawnArgs, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] })
     activeChildren.add(child)
+    onChild?.(child)
     let stdout = ''
     let stderr = ''
     const timer = setTimeout(() => {
@@ -290,6 +317,7 @@ function spawnClaudeStream(
   prompt: string,
   onDelta: (accumulated: string) => void,
   onStatus?: (status: string) => void,
+  onChild?: (c: ChildProcess) => void,
 ): Promise<{ code: number; result: string; sessionId: string; stderr: string }> {
   return new Promise(resolve => {
     let done = false
@@ -308,6 +336,7 @@ function spawnClaudeStream(
     const [bin, spawnArgs] = wrapSandbox(cwd, args)
     const child = spawn(bin, spawnArgs, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] })
     activeChildren.add(child)
+    onChild?.(child)
     const timer = setTimeout(() => {
       try { child.kill('SIGKILL') } catch {}
       finish(-2)
