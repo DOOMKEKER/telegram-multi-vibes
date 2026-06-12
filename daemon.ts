@@ -91,6 +91,10 @@ const AGENT_STREAM = process.env.TELEGRAM_AGENT_STREAM !== '0'
 // Opt-in OS-level confinement (macOS sandbox-exec): writes restricted to the
 // agent's cwd (+ ~/.claude state + temp). Default off.
 const AGENT_SANDBOX = process.env.TELEGRAM_AGENT_SANDBOX === '1'
+// Optional overrides; agent-runner falls back to its own defaults (idle 240s,
+// hard cap 1800s) when these are unset or 0.
+const AGENT_TIMEOUT_MS = Number(process.env.TELEGRAM_AGENT_TIMEOUT_MS) || undefined
+const AGENT_IDLE_MS = Number(process.env.TELEGRAM_AGENT_IDLE_MS) || undefined
 if (MULTI_SESSION) {
   initAgentRunner({
     stateDir: STATE_DIR,
@@ -99,9 +103,11 @@ if (MULTI_SESSION) {
     permissionMode: AGENT_PERMISSION_MODE,
     model: AGENT_MODEL,
     sandbox: AGENT_SANDBOX,
+    timeoutMs: AGENT_TIMEOUT_MS,
+    idleMs: AGENT_IDLE_MS,
   })
   process.stderr.write(
-    `telegram daemon: multi-session ON (cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${CLAUDE_BIN}, stream=${AGENT_STREAM}, sandbox=${AGENT_SANDBOX})\n`,
+    `telegram daemon: multi-session ON (cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${CLAUDE_BIN}, stream=${AGENT_STREAM}, sandbox=${AGENT_SANDBOX}, timeout=${AGENT_TIMEOUT_MS ?? 1_800_000}ms, idle=${AGENT_IDLE_MS ?? 240_000}ms)\n`,
   )
 }
 
@@ -516,6 +522,39 @@ function tgMarkdown(text: string): string | null {
   }
 }
 
+/** Bot API 10.1 Rich Messages. OFF by default; enable with AGENT_RICH=1.
+ *  Sends the assistant Markdown as a native rich message — tables, headings,
+ *  code blocks, lists, quotes render client-side, up to 32768 chars (no
+ *  chunking). grammy 1.41 has no typed method for this yet, so we go through
+ *  the raw proxy (it forwards any method name to callApi). Returns true on a
+ *  successful send; false (incl. when the flag is off or the API rejects it)
+ *  means the caller should fall back to the existing MarkdownV2/plain path. */
+const AGENT_RICH = process.env.AGENT_RICH === '1'
+// Monotonic, non-zero draft id for sendRichMessageDraft. Reused within one
+// streaming turn so Telegram animates the updates; new per turn.
+let __draftSeq = 0
+const nextDraftId = (): number => (__draftSeq = (__draftSeq + 1) % 2_000_000_000) + 1
+async function sendRich(
+  chat_id: string,
+  tid: number | undefined,
+  markdown: string,
+  baseOpts: Record<string, unknown>,
+): Promise<boolean> {
+  if (!AGENT_RICH) return false
+  try {
+    await (bot.api.raw as any).sendRichMessage({
+      chat_id,
+      ...(tid != null ? { message_thread_id: tid } : {}),
+      ...baseOpts,
+      rich_message: { markdown },
+    })
+    return true
+  } catch (e) {
+    process.stderr.write(`telegram daemon: sendRichMessage failed, falling back: ${e}\n`)
+    return false
+  }
+}
+
 async function sendAgentReply(
   chat_id: string,
   threadId: number | undefined,
@@ -527,6 +566,8 @@ async function sendAgentReply(
     ...(replyTo != null ? { reply_parameters: { message_id: replyTo } } : {}),
     ...(tid != null ? { message_thread_id: tid } : {}),
   }
+  // Native rich message first (flagged); falls through to MarkdownV2/plain.
+  if (await sendRich(chat_id, tid, text, baseOpts)) return
   // Prefer a single MarkdownV2 message so formatting renders; fall back to plain.
   const md = tgMarkdown(text)
   if (md != null && md.length <= MAX_CHUNK_LIMIT) {
@@ -567,8 +608,16 @@ async function streamAgentReply(
   }
   let mid: number | undefined
   const stopKb = new InlineKeyboard().text('⏹ Стоп', `stop:${chat_id}:${tkey ?? ''}`)
+  // Шаг B (flagged): live streaming via sendRichMessageDraft. Private chats only
+  // (the method takes a numeric private chat_id; supergroup ids are negative).
+  // The ⌛ placeholder + Stop button stay for control and graceful fallback; the
+  // draft is the animated rich preview, and the final persist is sendRich() below.
+  const useDraft = AGENT_RICH && !chat_id.startsWith('-')
+  const draft_id = nextDraftId()
+  const escHtml = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   try {
-    const ph = await bot.api.sendMessage(chat_id, '⌛', { ...baseOpts, reply_markup: stopKb })
+    const ph = await bot.api.sendMessage(chat_id, '💭 Думаю…', { ...baseOpts, reply_markup: stopKb })
     mid = ph.message_id
   } catch (e) {
     process.stderr.write(`telegram daemon: placeholder send failed: ${e}\n`)
@@ -580,6 +629,7 @@ async function streamAgentReply(
   const STREAM_CAP = 4000 // stay under the 4096 editMessageText limit while live
   let lastEdit = 0
   let lastShown = ''
+  let lastBar = ''  // last text on the status+Stop placeholder (draft mode)
   let acc = ''     // streamed answer text so far
   let status = ''  // current activity (💭 thinking / ⚙️ tool) during gaps
   let timer: ReturnType<typeof setTimeout> | null = null
@@ -588,11 +638,39 @@ async function streamAgentReply(
     if (mid == null) return
     // Show the answer text; while a tool/think runs with no new text, show the
     // activity (appended after any text, or alone before the first token).
-    const base = acc ? (status ? `${acc}\n\n${status}` : acc) : (status || '⌛')
+    const base = acc ? (status ? `${acc}\n\n${status}` : acc) : (status || '💭 Думаю…')
     const body = base.length > STREAM_CAP ? base.slice(0, STREAM_CAP) + ' …' : base
     if (body === lastShown) return
     lastEdit = Date.now()
     lastShown = body
+    if (useDraft) {
+      // Keep the placeholder as a compact status+Stop bar (not a bare ⌛): show
+      // the current activity, or "answering" once text flows. The animated rich
+      // answer itself streams via the draft below; Stop lives on this bar.
+      const bar = status || (acc ? '✍️ Отвечаю…' : '💭 Думаю…')
+      if (mid != null && bar !== lastBar) {
+        lastBar = bar
+        bot.api.editMessageText(chat_id, mid, bar, { reply_markup: stopKb }).catch(() => {})
+      }
+      // Activity-only (no answer text yet) → native <tg-thinking> block; once text
+      // streams → markdown. Partial markdown can be rejected mid-stream → fall back
+      // to a plain edit on the bar so the live view never stalls.
+      const rich =
+        status && !acc
+          ? { html: `<tg-thinking>${escHtml(status)}</tg-thinking>` }
+          : { markdown: body }
+      ;(bot.api.raw as any)
+        .sendRichMessageDraft({
+          chat_id: Number(chat_id),
+          ...(tid != null ? { message_thread_id: tid } : {}),
+          draft_id,
+          rich_message: rich,
+        })
+        .catch(() => {
+          if (mid != null) bot.api.editMessageText(chat_id, mid, body, { reply_markup: stopKb }).catch(() => {})
+        })
+      return
+    }
     bot.api.editMessageText(chat_id, mid, body, { reply_markup: stopKb }).catch((e: unknown) => {
       // Ignore "message is not modified" (400); back off on rate limit (429).
       const ra = e instanceof GrammyError ? e.parameters?.retry_after : undefined
@@ -621,6 +699,12 @@ async function streamAgentReply(
   const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
   const mode = access.chunkMode ?? 'length'
   const body = finalText || '(empty)'
+
+  // Native rich message first (flagged): send it, then drop the ⌛ placeholder.
+  if (await sendRich(chat_id, tid, body, baseOpts)) {
+    if (mid != null) await bot.api.deleteMessage(chat_id, mid).catch(() => {})
+    return
+  }
 
   // Final render: prefer a single MarkdownV2 message so formatting renders;
   // fall back to plain, chunked, on conversion/length/API failure.
@@ -681,6 +765,22 @@ async function dispatchRpc(method: string, params: Record<string, unknown>, _c: 
       })
       return { message_id: sent.message_id }
     }
+    case 'sendRichMessage': {
+      // Bot API 10.1 rich message; markdown rendered natively (no chunking).
+      // grammy has no typed method yet → raw proxy. Caller (server.ts) falls
+      // back to chunked sendMessage if this throws.
+      const chat_id = String(params.chat_id)
+      const text = String(params.text)
+      const reply_to = params.reply_to != null ? Number(params.reply_to) : undefined
+      const thread_id = effectiveSendThreadId(params.thread_id as string | number | undefined)
+      const sent = await (bot.api.raw as any).sendRichMessage({
+        chat_id,
+        ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
+        ...(thread_id != null ? { message_thread_id: thread_id } : {}),
+        rich_message: { markdown: text },
+      })
+      return { message_id: sent.message_id }
+    }
     case 'sendPhoto':
     case 'sendDocument': {
       const chat_id = String(params.chat_id)
@@ -708,6 +808,16 @@ async function dispatchRpc(method: string, params: Record<string, unknown>, _c: 
       const chat_id = String(params.chat_id)
       const message_id = Number(params.message_id)
       const text = String(params.text)
+      if (params.rich) {
+        // Bot API 10.1: replace message content with a native rich message.
+        const edited = await (bot.api.raw as any).editMessageText({
+          chat_id,
+          message_id,
+          rich_message: { markdown: text },
+        })
+        const mid = typeof edited === 'object' ? edited.message_id : message_id
+        return { message_id: mid }
+      }
       const parseMode = params.parse_mode as 'MarkdownV2' | undefined
       const edited = await bot.api.editMessageText(chat_id, message_id, text,
         ...(parseMode ? [{ parse_mode: parseMode }] : []),

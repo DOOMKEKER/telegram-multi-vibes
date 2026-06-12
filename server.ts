@@ -214,10 +214,19 @@ function spawnDaemon(): void {
   // Use process.execPath (= the bun binary that runs us) so we don't need
   // bun on PATH for the spawn to work.
   const runtime = process.execPath || 'bun'
+  // Redirect daemon stderr to a log file so we can see polling errors,
+  // 409 Conflicts, gate decisions, etc — otherwise stdio:'ignore' eats
+  // them and the daemon is a black box.
+  const logPath = join(STATE_DIR, 'daemon.log')
+  let logFd: number | undefined
+  try {
+    const { openSync } = require('fs')
+    logFd = openSync(logPath, 'a')
+  } catch {}
   process.stderr.write(`telegram channel: spawning daemon ${runtime} ${DAEMON_SCRIPT}\n`)
   const child = spawn(runtime, [DAEMON_SCRIPT], {
     detached: true,
-    stdio: 'ignore',
+    stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
     env: process.env,
   })
   child.on('error', err => {
@@ -364,8 +373,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['text', 'markdownv2', 'rich'],
+            description: "Rendering mode. 'markdownv2' enables inline formatting (caller must escape per MarkdownV2 rules). 'rich' (Bot API 10.1) renders full Markdown natively — headings, tables, code blocks, lists, quotes — in one message up to 32768 chars, no escaping; falls back to plain if unavailable. Default: 'text'.",
           },
         },
         required: ['chat_id', 'text'],
@@ -406,8 +415,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string' },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting. Caller must escape special chars per MarkdownV2 rules. Default: 'text'.",
+            enum: ['text', 'markdownv2', 'rich'],
+            description: "Rendering mode. 'markdownv2' enables inline formatting (escape per MarkdownV2). 'rich' (Bot API 10.1) renders full Markdown natively; falls back to plain if unavailable. Default: 'text'.",
           },
         },
         required: ['chat_id', 'message_id', 'text'],
@@ -442,19 +451,39 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
 
-        for (let i = 0; i < chunks.length; i++) {
-          const shouldReplyTo = reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
-          const r = await rpcCall('sendMessage', {
-            chat_id,
-            text: chunks[i],
-            ...(shouldReplyTo ? { reply_to } : {}),
-            ...(thread_id != null ? { thread_id } : {}),
-            ...(parseMode ? { parse_mode: parseMode } : {}),
-          }) as { message_id: number }
-          sentIds.push(r.message_id)
+        // Bot API 10.1 rich message: one native message, no chunking. On any
+        // failure (server too old / not enabled) fall back to chunked plain.
+        let richOk = false
+        if (format === 'rich') {
+          try {
+            const r = await rpcCall('sendRichMessage', {
+              chat_id,
+              text,
+              ...(reply_to != null && replyMode !== 'off' ? { reply_to } : {}),
+              ...(thread_id != null ? { thread_id } : {}),
+            }) as { message_id: number }
+            sentIds.push(r.message_id)
+            richOk = true
+          } catch (e) {
+            process.stderr.write(`telegram channel: sendRichMessage failed, falling back to chunked: ${e}\n`)
+          }
+        }
+
+        if (!richOk) {
+          const chunks = chunk(text, limit, mode)
+          for (let i = 0; i < chunks.length; i++) {
+            const shouldReplyTo = reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
+            const r = await rpcCall('sendMessage', {
+              chat_id,
+              text: chunks[i],
+              ...(shouldReplyTo ? { reply_to } : {}),
+              ...(thread_id != null ? { thread_id } : {}),
+              ...(parseMode ? { parse_mode: parseMode } : {}),
+            }) as { message_id: number }
+            sentIds.push(r.message_id)
+          }
         }
 
         for (const f of files) {
@@ -501,6 +530,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
         const editFormat = (args.format as string | undefined) ?? 'text'
+        if (editFormat === 'rich') {
+          try {
+            const rr = await rpcCall('editMessageText', {
+              chat_id: args.chat_id as string,
+              message_id: args.message_id as string,
+              text: args.text as string,
+              rich: true,
+            }) as { message_id: number | string }
+            return { content: [{ type: 'text', text: `edited (id: ${rr.message_id})` }] }
+          } catch (e) {
+            process.stderr.write(`telegram channel: editMessageText(rich) failed, falling back: ${e}\n`)
+          }
+        }
         const parseMode = editFormat === 'markdownv2' ? 'MarkdownV2' : undefined
         const r = await rpcCall('editMessageText', {
           chat_id: args.chat_id as string,
