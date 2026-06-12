@@ -29,8 +29,12 @@ export type AgentConfig = {
   claudeBin: string
   permissionMode: string
   model?: string
-  /** Hard cap on a single agent turn before the child is killed. */
+  /** Hard backstop on a single agent turn before the child is killed. */
   timeoutMs?: number
+  /** Idle cap: kill only after this long with NO output. Resets on every chunk,
+   *  so a turn that keeps streaming (thinking/text/tools) is never killed for
+   *  "thinking too long" — only a genuinely wedged process trips it. */
+  idleMs?: number
   /** Wrap the agent in macOS sandbox-exec, confining writes to its cwd. */
   sandbox?: boolean
 }
@@ -155,7 +159,7 @@ function saveSessions(): void {
 }
 
 export function initAgentRunner(c: AgentConfig): void {
-  cfg = { timeoutMs: 600_000, ...c }
+  cfg = { ...c, timeoutMs: c.timeoutMs ?? 1_800_000, idleMs: c.idleMs ?? 240_000 }
   SESSIONS_FILE = join(c.stateDir, 'sessions.json')
   mkdirSync(c.cwd, { recursive: true })
   loadSessions()
@@ -243,6 +247,19 @@ async function doTurn(
     return '⏹ Остановлено.'
   }
 
+  // Watchdog timeout (-2) that still produced text: deliver the partial answer
+  // with a note instead of throwing it away. A long-but-working turn that hit a
+  // cap shouldn't surface as a bare "agent failed".
+  if (code === -2 && result.trim()) {
+    log(`claude timed out (-2) but produced ${result.length} chars — delivering partial`)
+    if (newSessionId) rec.sessionId = newSessionId
+    rec.started = true
+    rec.fails = 0
+    rec.lastActivity = Date.now()
+    saveSessions()
+    return `${result}\n\n⏳ (прервал по тайм-ауту — это всё, что успел сгенерировать)`
+  }
+
   if (code !== 0) {
     log(`claude exited ${code}: ${stderr.slice(0, 800)}`)
     if (!rec.started) {
@@ -326,22 +343,41 @@ function spawnClaudeStream(
     let acc = ''
     let result = ''
     let sessionId = ''
+    let idleTimer: ReturnType<typeof setTimeout> | undefined
     const finish = (code: number) => {
       if (done) return
       done = true
-      clearTimeout(timer)
+      clearTimeout(idleTimer)
+      clearTimeout(hardTimer)
       activeChildren.delete(child)
       resolve({ code, result: result || acc, sessionId, stderr })
+    }
+    const killWith = (note: string) => {
+      stderr += `\n[${note}]`
+      try { child.kill('SIGKILL') } catch {}
+      finish(-2)
+    }
+    // Idle watchdog: reset on every byte the agent emits, so a long-but-working
+    // turn never dies. Only true silence (a wedged process) trips it.
+    const bump = () => {
+      clearTimeout(idleTimer)
+      idleTimer = setTimeout(
+        () => killWith(`no output for ${Math.round((cfg.idleMs ?? 240_000) / 1000)}s`),
+        cfg.idleMs ?? 240_000,
+      )
     }
     const [bin, spawnArgs] = wrapSandbox(cwd, args)
     const child = spawn(bin, spawnArgs, { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] })
     activeChildren.add(child)
     onChild?.(child)
-    const timer = setTimeout(() => {
-      try { child.kill('SIGKILL') } catch {}
-      finish(-2)
-    }, cfg.timeoutMs)
+    // Absolute backstop for a turn that keeps emitting forever (runaway loop).
+    const hardTimer = setTimeout(
+      () => killWith(`hit hard cap ${Math.round((cfg.timeoutMs ?? 1_800_000) / 1000)}s`),
+      cfg.timeoutMs ?? 1_800_000,
+    )
+    bump()
     child.stdout.on('data', d => {
+      bump()
       buf += d.toString('utf8')
       let nl = buf.indexOf('\n')
       while (nl !== -1) {
