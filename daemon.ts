@@ -16,7 +16,7 @@
  * server.ts still owns polling.
  */
 
-import { createServer as createNetServer, type Socket } from 'net'
+import { createServer as createNetServer, connect as netConnect, type Socket } from 'net'
 import {
   existsSync,
   mkdirSync,
@@ -137,6 +137,21 @@ export type DaemonFrame =
 
 // ---- Single-instance lifecycle ---------------------------------------------
 
+// Probe whether a live daemon is currently listening on the control socket.
+// connect() succeeding => a daemon is alive; ENOENT/ECONNREFUSED => stale/none.
+function socketAlive(): Promise<boolean> {
+  return new Promise(resolve => {
+    const s = netConnect(SOCKET_PATH)
+    s.once('connect', () => { try { s.destroy() } catch {}; resolve(true) })
+    s.once('error', () => { try { s.destroy() } catch {}; resolve(false) })
+  })
+}
+
+// Replace an existing daemon (intentional restart): SIGTERM the recorded pid and
+// wait until it releases the control socket. Two siblings from one launch both
+// read the SAME old pid here (neither has claimed the pid file yet), so they
+// SIGTERM only the old daemon — never each other. The pid file is claimed later,
+// only by whoever wins the socket bind below.
 try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
   if (stale > 1 && stale !== process.pid) {
@@ -144,16 +159,16 @@ try {
       process.kill(stale, 0)
       process.stderr.write(`telegram daemon: replacing stale daemon pid=${stale}\n`)
       process.kill(stale, 'SIGTERM')
-      await new Promise(r => setTimeout(r, 500))
     } catch { /* not running */ }
   }
 } catch { /* no PID file */ }
 
-if (existsSync(SOCKET_PATH)) {
-  try { unlinkSync(SOCKET_PATH) } catch {}
+// Wait (bounded, ~5s) for the socket to free, so the bind below is the real
+// arbiter. If the old daemon crashed and left a stale socket file, socketAlive()
+// returns false immediately and the bind step removes the leftover.
+for (let i = 0; i < 50 && (await socketAlive()); i++) {
+  await new Promise(r => setTimeout(r, 100))
 }
-
-writeFileSync(PID_FILE, String(process.pid))
 
 let shuttingDown = false
 
@@ -932,14 +947,40 @@ function handleClientFrame(c: Client, frame: ClientFrame): void {
   }
 }
 
-ipcServer.on('error', err => {
-  process.stderr.write(`telegram daemon: ipc server error: ${err}\n`)
-  shutdown(1)
-})
-
-ipcServer.listen(SOCKET_PATH, () => {
-  try { chmodSync(SOCKET_PATH, 0o600) } catch {}
-  process.stderr.write(`telegram daemon: listening on ${SOCKET_PATH} pid=${process.pid}\n`)
+// Acquire the control socket as an exclusive singleton lock, then gate Telegram
+// polling on it (bot.start runs only after this resolves). Binding is the
+// authority: whoever binds is THE daemon. A loser — e.g. a sibling from the same
+// launch — finds a live owner and exits *before* polling, so two daemons never
+// collide on getUpdates (the 409 Conflict storm). A stale socket left by a
+// crashed daemon (connection refused) is detected and removed.
+await new Promise<void>(resolve => {
+  const attempt = (n: number) => {
+    const onError = async (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE') {
+        if (await socketAlive()) {
+          process.stderr.write(`telegram daemon: another daemon owns the socket — standing down (pid=${process.pid})\n`)
+          process.exit(0)
+        }
+        try { unlinkSync(SOCKET_PATH) } catch {}
+        if (n < 5) return attempt(n + 1)
+      }
+      process.stderr.write(`telegram daemon: cannot bind control socket: ${err} — exiting\n`)
+      process.exit(1)
+    }
+    ipcServer.once('error', onError)
+    ipcServer.listen(SOCKET_PATH, () => {
+      ipcServer.off('error', onError)
+      try { chmodSync(SOCKET_PATH, 0o600) } catch {}
+      writeFileSync(PID_FILE, String(process.pid))
+      ipcServer.on('error', e => {
+        process.stderr.write(`telegram daemon: ipc server error: ${e}\n`)
+        shutdown(1)
+      })
+      process.stderr.write(`telegram daemon: listening on ${SOCKET_PATH} pid=${process.pid}\n`)
+      resolve()
+    })
+  }
+  attempt(0)
 })
 
 // ---- Bot construction & inbound flow --------------------------------------
