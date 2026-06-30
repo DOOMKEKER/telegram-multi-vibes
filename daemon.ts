@@ -75,21 +75,38 @@ if (!TOKEN) {
   process.exit(1)
 }
 
-// ---- Multi-session (one Claude agent per topic) ---------------------------
-// When on, delivered messages are handed to a per-topic `claude -p --resume`
-// agent instead of being broadcast to MCP clients. See docs/DESIGN-multisession.md.
+// ---- Multi-session (one CLI agent per topic) ------------------------------
+// When on, delivered messages are handed to a per-topic Claude/Codex agent
+// instead of being broadcast to MCP clients. See docs/DESIGN-multisession.md.
 const MULTI_SESSION = process.env.TELEGRAM_MULTI_SESSION === '1'
 // NB: must live OUTSIDE ~/.claude — Claude Code blocks writes to its own config
 // dir as "sensitive", so an agent cwd inside STATE_DIR can't create files.
 const AGENT_CWD = process.env.TELEGRAM_AGENT_CWD ?? join(homedir(), 'telegram-agent-workspace')
+const AGENT_PROVIDER = (() => {
+  const v = (process.env.TELEGRAM_AGENT_PROVIDER ?? 'claude').toLowerCase()
+  if (v === 'claude' || v === 'codex') return v
+  process.stderr.write(`telegram daemon: TELEGRAM_AGENT_PROVIDER must be "claude" or "codex", got ${v}\n`)
+  process.exit(1)
+})()
 const AGENT_PERMISSION_MODE = process.env.TELEGRAM_AGENT_PERMISSION_MODE ?? 'acceptEdits'
 const AGENT_MODEL = process.env.TELEGRAM_AGENT_MODEL
-const CLAUDE_BIN = process.env.TELEGRAM_CLAUDE_BIN ?? 'claude'
+const AGENT_BIN = AGENT_PROVIDER === 'codex'
+  ? (process.env.TELEGRAM_CODEX_BIN ?? process.env.TELEGRAM_AGENT_BIN ?? 'codex')
+  : (process.env.TELEGRAM_CLAUDE_BIN ?? process.env.TELEGRAM_AGENT_BIN ?? 'claude')
+const CODEX_PROFILE = process.env.TELEGRAM_CODEX_PROFILE
+const CODEX_SANDBOX: 'read-only' | 'workspace-write' | 'danger-full-access' | undefined = (() => {
+  const v = process.env.TELEGRAM_CODEX_SANDBOX
+  if (v == null || v === 'read-only' || v === 'workspace-write' || v === 'danger-full-access') return v
+  process.stderr.write(`telegram daemon: TELEGRAM_CODEX_SANDBOX must be read-only, workspace-write, or danger-full-access; got ${v}\n`)
+  process.exit(1)
+})()
+// Requested default: Codex headless turns run with full approval+sandbox bypass.
+const CODEX_DANGEROUS_BYPASS = AGENT_PROVIDER === 'codex' && process.env.TELEGRAM_CODEX_DANGEROUS_BYPASS !== '0'
 // Stream the agent's reply into one message (placeholder → live edits). On by
 // default; set TELEGRAM_AGENT_STREAM=0 for a single final message instead.
 const AGENT_STREAM = process.env.TELEGRAM_AGENT_STREAM !== '0'
 // Opt-in OS-level confinement (macOS sandbox-exec): writes restricted to the
-// agent's cwd (+ ~/.claude state + temp). Default off.
+// agent's cwd (+ ~/.claude/~/.codex state + temp). Default off.
 const AGENT_SANDBOX = process.env.TELEGRAM_AGENT_SANDBOX === '1'
 // Optional overrides; agent-runner falls back to its own defaults (idle 240s,
 // hard cap 1800s) when these are unset or 0.
@@ -99,15 +116,19 @@ if (MULTI_SESSION) {
   initAgentRunner({
     stateDir: STATE_DIR,
     cwd: AGENT_CWD,
-    claudeBin: CLAUDE_BIN,
+    provider: AGENT_PROVIDER,
+    agentBin: AGENT_BIN,
     permissionMode: AGENT_PERMISSION_MODE,
     model: AGENT_MODEL,
+    codexProfile: CODEX_PROFILE,
+    codexSandbox: CODEX_SANDBOX,
+    codexDangerousBypass: CODEX_DANGEROUS_BYPASS,
     sandbox: AGENT_SANDBOX,
     timeoutMs: AGENT_TIMEOUT_MS,
     idleMs: AGENT_IDLE_MS,
   })
   process.stderr.write(
-    `telegram daemon: multi-session ON (cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${CLAUDE_BIN}, stream=${AGENT_STREAM}, sandbox=${AGENT_SANDBOX}, timeout=${AGENT_TIMEOUT_MS ?? 1_800_000}ms, idle=${AGENT_IDLE_MS ?? 240_000}ms)\n`,
+    `telegram daemon: multi-session ON (provider=${AGENT_PROVIDER}, cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${AGENT_BIN}, stream=${AGENT_STREAM}, sandbox=${AGENT_SANDBOX}, codexDanger=${CODEX_DANGEROUS_BYPASS}, timeout=${AGENT_TIMEOUT_MS ?? 1_800_000}ms, idle=${AGENT_IDLE_MS ?? 240_000}ms)\n`,
   )
 }
 
@@ -1379,8 +1400,18 @@ try {
 // ---- Polling loop ----------------------------------------------------------
 
 void (async () => {
+  try {
+    process.stderr.write('telegram daemon: initializing bot\n')
+    await bot.init()
+    botUsername = bot.botInfo.username
+    process.stderr.write(`telegram daemon: initialized @${botUsername}\n`)
+  } catch (err) {
+    process.stderr.write(`telegram daemon: bot init failed: ${err}\n`)
+    shutdown(1)
+  }
   for (let attempt = 1; ; attempt++) {
     try {
+      process.stderr.write(`telegram daemon: starting polling attempt ${attempt}\n`)
       await bot.start({
         onStart: info => {
           attempt = 0
