@@ -112,6 +112,15 @@ const AGENT_SANDBOX = process.env.TELEGRAM_AGENT_SANDBOX === '1'
 // hard cap 1800s) when these are unset or 0.
 const AGENT_TIMEOUT_MS = Number(process.env.TELEGRAM_AGENT_TIMEOUT_MS) || undefined
 const AGENT_IDLE_MS = Number(process.env.TELEGRAM_AGENT_IDLE_MS) || undefined
+function envMs(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw == null || raw.trim() === '') return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : fallback
+}
+const AGENT_BATCH_MS = envMs('TELEGRAM_AGENT_BATCH_MS', 1500)
+const AGENT_FILE_BATCH_MS = envMs('TELEGRAM_AGENT_FILE_BATCH_MS', 6000)
+const AGENT_INBOX_DIR = process.env.TELEGRAM_AGENT_INBOX_DIR
 if (MULTI_SESSION) {
   initAgentRunner({
     stateDir: STATE_DIR,
@@ -128,7 +137,7 @@ if (MULTI_SESSION) {
     idleMs: AGENT_IDLE_MS,
   })
   process.stderr.write(
-    `telegram daemon: multi-session ON (provider=${AGENT_PROVIDER}, cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${AGENT_BIN}, stream=${AGENT_STREAM}, sandbox=${AGENT_SANDBOX}, codexDanger=${CODEX_DANGEROUS_BYPASS}, timeout=${AGENT_TIMEOUT_MS ?? 1_800_000}ms, idle=${AGENT_IDLE_MS ?? 240_000}ms)\n`,
+    `telegram daemon: multi-session ON (provider=${AGENT_PROVIDER}, cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${AGENT_BIN}, stream=${AGENT_STREAM}, sandbox=${AGENT_SANDBOX}, codexDanger=${CODEX_DANGEROUS_BYPASS}, timeout=${AGENT_TIMEOUT_MS ?? 1_800_000}ms, idle=${AGENT_IDLE_MS ?? 240_000}ms, batch=${AGENT_BATCH_MS}ms, fileBatch=${AGENT_FILE_BATCH_MS}ms)\n`,
   )
 }
 
@@ -331,7 +340,18 @@ function effectiveSendThreadId(raw: string | number | undefined | null): number 
 }
 
 function safeName(s: string | undefined): string | undefined {
-  return s?.replace(/[<>\[\]\r\n;]/g, '_')
+  const cleaned = s
+    ?.replace(/[<>\[\]\r\n;:/\\]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!cleaned || cleaned === '.' || cleaned === '..') return undefined
+  return cleaned.slice(0, 180)
+}
+
+function expandHomePath(p: string): string {
+  if (p === '~') return homedir()
+  if (p.startsWith('~/')) return join(homedir(), p.slice(2))
+  return p
 }
 
 // Local speech-to-text via whisper.cpp. Audio never leaves the machine; no API
@@ -1017,6 +1037,196 @@ type AttachmentMeta = {
   name?: string
 }
 
+type AgentAttachment = AttachmentMeta & {
+  path?: string
+  error?: string
+}
+
+type AgentInboundItem = {
+  chat_id: string
+  threadId: number | undefined
+  tkey: string | undefined
+  messageId: number | undefined
+  user: string
+  user_id: string
+  ts: string
+  text: string
+  mediaGroupId?: string
+  attachments: AgentAttachment[]
+  attachmentDownloads: Promise<AgentAttachment>[]
+}
+
+type AgentBatch = {
+  chat_id: string
+  threadId: number | undefined
+  tkey: string | undefined
+  replyTo: number | undefined
+  hasAttachment: boolean
+  items: AgentInboundItem[]
+  timer: ReturnType<typeof setTimeout>
+}
+
+const agentBatches = new Map<string, AgentBatch>()
+
+function getMediaGroupId(ctx: Context): string | undefined {
+  const mediaGroupId = (ctx.message as { media_group_id?: unknown } | undefined)?.media_group_id
+  return typeof mediaGroupId === 'string' && mediaGroupId ? mediaGroupId : undefined
+}
+
+function agentBatchKey(chat_id: string, tkey: string | undefined): string {
+  return `${chat_id}:${tkey ?? ''}`
+}
+
+function agentInboxBase(chat_id: string, tkey: string | undefined): string {
+  const topicDir = `${chat_id}_${tkey ?? 'main'}`.replace(/[^a-zA-Z0-9_.-]/g, '_')
+  const base = AGENT_INBOX_DIR
+    ? expandHomePath(AGENT_INBOX_DIR)
+    : join(getTopicCwd(chat_id, tkey), '.telegram-inbox')
+  return join(base, topicDir)
+}
+
+function fileExtFromTelegramPath(filePath: string, fallback = 'bin'): string {
+  const last = filePath.split('/').pop() ?? ''
+  const dot = last.lastIndexOf('.')
+  const ext = dot >= 0 ? last.slice(dot + 1).replace(/[^a-zA-Z0-9]/g, '') : ''
+  return ext || fallback
+}
+
+function localAttachmentName(meta: AttachmentMeta, filePath: string, uniq: string): string {
+  const ext = fileExtFromTelegramPath(filePath, meta.kind === 'photo' ? 'jpg' : 'bin')
+  const original = safeName(meta.name)
+  const leaf = original && /\.[^.]{1,12}$/.test(original)
+    ? original
+    : `${original ?? meta.kind}.${ext}`
+  return `${Date.now()}-${randomBytes(3).toString('hex')}-${uniq}-${leaf}`
+}
+
+async function downloadAgentAttachment(
+  chat_id: string,
+  tkey: string | undefined,
+  meta: AttachmentMeta,
+): Promise<AgentAttachment> {
+  if (meta.size != null && meta.size > MAX_ATTACHMENT_BYTES) {
+    return { ...meta, error: `too large: ${meta.size} bytes > ${MAX_ATTACHMENT_BYTES}` }
+  }
+  try {
+    const file = await bot.api.getFile(meta.file_id)
+    if (!file.file_path) return { ...meta, error: 'Telegram returned no file_path' }
+    const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`)
+    if (!res.ok) return { ...meta, error: `download failed: HTTP ${res.status}` }
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (buf.length > MAX_ATTACHMENT_BYTES) {
+      return { ...meta, size: buf.length, error: `too large: ${buf.length} bytes > ${MAX_ATTACHMENT_BYTES}` }
+    }
+    const uniq = (file.file_unique_id ?? 'dl').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+    const dir = agentInboxBase(chat_id, tkey)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const path = join(dir, localAttachmentName(meta, file.file_path, uniq))
+    writeFileSync(path, buf, { mode: 0o600 })
+    return { ...meta, size: meta.size ?? buf.length, path }
+  } catch (e) {
+    return { ...meta, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+function formatAttachment(a: AgentAttachment): string {
+  const bits = [
+    `${a.kind}${a.name ? ` "${a.name}"` : ''}`,
+    a.path ? `local_path=${a.path}` : undefined,
+    a.mime ? `mime=${a.mime}` : undefined,
+    a.size != null ? `size_bytes=${a.size}` : undefined,
+    a.error ? `download_error=${a.error}` : undefined,
+  ].filter(Boolean)
+  return `- ${bits.join(' | ')}`
+}
+
+function formatBatchItem(item: AgentInboundItem, idx: number, total: number): string {
+  const title = total > 1
+    ? `${idx + 1}. Message from ${item.user} at ${item.ts}${item.mediaGroupId ? ` media_group=${item.mediaGroupId}` : ''}`
+    : `Message from ${item.user} at ${item.ts}${item.mediaGroupId ? ` media_group=${item.mediaGroupId}` : ''}`
+  const lines = [title, item.text.trim() || '(no text)']
+  if (item.attachments.length) {
+    lines.push('', 'Attachments downloaded locally. Use local_path values to inspect files:')
+    for (const a of item.attachments) lines.push(formatAttachment(a))
+  }
+  return lines.join('\n')
+}
+
+function buildAgentBatchPrompt(items: AgentInboundItem[]): string {
+  if (items.length === 1 && items[0].attachments.length === 0) return items[0].text
+  const total = items.length
+  const intro = total > 1
+    ? `Telegram batch: ${total} messages arrived close together. Treat them as one user request and answer once.`
+    : 'Telegram message with local attachments.'
+  return [
+    intro,
+    '',
+    ...items.map((item, idx) => formatBatchItem(item, idx, total)),
+  ].join('\n\n')
+}
+
+function enqueueAgentInbound(item: AgentInboundItem): void {
+  const key = agentBatchKey(item.chat_id, item.tkey)
+  const existing = agentBatches.get(key)
+  const hasAttachment = item.attachments.length > 0 || item.attachmentDownloads.length > 0
+  if (existing) {
+    clearTimeout(existing.timer)
+    existing.items.push(item)
+    existing.replyTo = item.messageId
+    existing.hasAttachment = existing.hasAttachment || hasAttachment || !!item.mediaGroupId
+    const delay = existing.hasAttachment ? AGENT_FILE_BATCH_MS : AGENT_BATCH_MS
+    existing.timer = setTimeout(() => {
+      void flushAgentBatch(key).catch(err => process.stderr.write(`telegram daemon: agent batch failed: ${err}\n`))
+    }, delay)
+    return
+  }
+
+  const batch: AgentBatch = {
+    chat_id: item.chat_id,
+    threadId: item.threadId,
+    tkey: item.tkey,
+    replyTo: item.messageId,
+    hasAttachment: hasAttachment || !!item.mediaGroupId,
+    items: [item],
+    timer: setTimeout(() => {
+      void flushAgentBatch(key).catch(err => process.stderr.write(`telegram daemon: agent batch failed: ${err}\n`))
+    }, hasAttachment || item.mediaGroupId ? AGENT_FILE_BATCH_MS : AGENT_BATCH_MS),
+  }
+  agentBatches.set(key, batch)
+}
+
+async function flushAgentBatch(key: string): Promise<void> {
+  const batch = agentBatches.get(key)
+  if (!batch) return
+  clearTimeout(batch.timer)
+  agentBatches.delete(key)
+
+  for (const item of batch.items) {
+    if (item.attachmentDownloads.length) {
+      item.attachments.push(...await Promise.all(item.attachmentDownloads))
+      item.attachmentDownloads = []
+    }
+  }
+
+  const prompt = buildAgentBatchPrompt(batch.items)
+  if (AGENT_STREAM) {
+    await streamAgentReply(batch.chat_id, batch.threadId, batch.tkey, prompt, batch.replyTo)
+    return
+  }
+  try {
+    const reply = await runAgentTurn(batch.chat_id, batch.tkey, prompt)
+    await sendAgentReply(batch.chat_id, batch.threadId, reply, batch.replyTo)
+  } catch (err) {
+    process.stderr.write(`telegram daemon: agent turn failed: ${err}\n`)
+    await sendAgentReply(
+      batch.chat_id,
+      batch.threadId,
+      `⚠️ agent error: ${err instanceof Error ? err.message : String(err)}`,
+      batch.replyTo,
+    )
+  }
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -1038,6 +1248,7 @@ async function handleInbound(
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
   const threadId = ctx.message?.message_thread_id
+  const mediaGroupId = getMediaGroupId(ctx)
 
   // Permission-reply intercept: "yes xxxxx" / "no xxxxx" → resolve and route
   // back to the originating client.
@@ -1097,8 +1308,8 @@ async function handleInbound(
     }
   }
 
-  // Multi-session: hand the message to this topic's own Claude agent and reply
-  // back into the same topic. (Phase 1 ignores images/attachments — text only.)
+  // Multi-session: hand messages to this topic's own Claude/Codex agent. Quick
+  // bursts are batched so a pile of files produces one turn and one reply.
   if (MULTI_SESSION) {
     const tkey = threadId != null ? String(threadId) : undefined
 
@@ -1130,23 +1341,19 @@ async function handleInbound(
         return
       }
 
-      if (AGENT_STREAM) {
-        void streamAgentReply(chat_id, threadId, tkey, content, msgId).catch(err => {
-          process.stderr.write(`telegram daemon: agent stream failed: ${err}\n`)
-        })
-      } else {
-        void runAgentTurn(chat_id, tkey, content)
-          .then(reply => sendAgentReply(chat_id, threadId, reply, msgId))
-          .catch(err => {
-            process.stderr.write(`telegram daemon: agent turn failed: ${err}\n`)
-            return sendAgentReply(
-              chat_id,
-              threadId,
-              `⚠️ agent error: ${err instanceof Error ? err.message : String(err)}`,
-              msgId,
-            )
-          })
-      }
+      enqueueAgentInbound({
+        chat_id,
+        threadId,
+        tkey,
+        messageId: msgId,
+        user: from.username ? `@${from.username}` : String(from.id),
+        user_id: String(from.id),
+        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+        text: content,
+        mediaGroupId,
+        attachments: [],
+        attachmentDownloads: attach ? [downloadAgentAttachment(chat_id, tkey, attach)] : [],
+      })
       return
     }
     // human-bound topic → fall through to the MCP broadcast below
@@ -1304,9 +1511,9 @@ bot.on('message:text', async ctx => {
 
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
+  const photos = ctx.message.photo
+  const best = photos[photos.length - 1]
   await handleInbound(ctx, caption, async () => {
-    const photos = ctx.message.photo
-    const best = photos[photos.length - 1]
     try {
       const file = await bot.api.getFile(best.file_id)
       if (!file.file_path) return undefined
@@ -1321,6 +1528,8 @@ bot.on('message:photo', async ctx => {
       writeFileSync(path, buf)
       return path
     } catch { return undefined }
+  }, {
+    kind: 'photo', file_id: best.file_id, size: best.file_size, mime: 'image/jpeg',
   })
 })
 

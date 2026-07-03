@@ -34,6 +34,9 @@ TELEGRAM_AGENT_MODEL=opus                      # auto mode requires a capable mo
 
 TELEGRAM_AGENT_CWD=/Users/you/agent-workspace # default working dir (NOT under ~/.claude)
 TELEGRAM_STREAM_EDIT_MS=600                    # live-edit throttle (~1s floor vs 429)
+# TELEGRAM_AGENT_BATCH_MS=1500                 # debounce quick text bursts into one agent turn
+# TELEGRAM_AGENT_FILE_BATCH_MS=6000            # wait for file batches/albums before replying
+# TELEGRAM_AGENT_INBOX_DIR=/Users/you/inbox    # optional; default is <topic cwd>/.telegram-inbox
 
 # TELEGRAM_AGENT_SANDBOX=1   # optional: macOS sandbox-exec, confine writes to the
                             # topic's cwd (+ ~/.claude, ~/.codex, temp).
