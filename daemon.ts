@@ -16,7 +16,7 @@
  * server.ts still owns polling.
  */
 
-import { createServer as createNetServer, type Socket } from 'net'
+import { createServer as createNetServer, connect as netConnect, type Socket } from 'net'
 import {
   existsSync,
   mkdirSync,
@@ -75,33 +75,69 @@ if (!TOKEN) {
   process.exit(1)
 }
 
-// ---- Multi-session (one Claude agent per topic) ---------------------------
-// When on, delivered messages are handed to a per-topic `claude -p --resume`
-// agent instead of being broadcast to MCP clients. See docs/DESIGN-multisession.md.
+// ---- Multi-session (one CLI agent per topic) ------------------------------
+// When on, delivered messages are handed to a per-topic Claude/Codex agent
+// instead of being broadcast to MCP clients. See docs/DESIGN-multisession.md.
 const MULTI_SESSION = process.env.TELEGRAM_MULTI_SESSION === '1'
 // NB: must live OUTSIDE ~/.claude — Claude Code blocks writes to its own config
 // dir as "sensitive", so an agent cwd inside STATE_DIR can't create files.
 const AGENT_CWD = process.env.TELEGRAM_AGENT_CWD ?? join(homedir(), 'telegram-agent-workspace')
+const AGENT_PROVIDER = (() => {
+  const v = (process.env.TELEGRAM_AGENT_PROVIDER ?? 'claude').toLowerCase()
+  if (v === 'claude' || v === 'codex') return v
+  process.stderr.write(`telegram daemon: TELEGRAM_AGENT_PROVIDER must be "claude" or "codex", got ${v}\n`)
+  process.exit(1)
+})()
 const AGENT_PERMISSION_MODE = process.env.TELEGRAM_AGENT_PERMISSION_MODE ?? 'acceptEdits'
 const AGENT_MODEL = process.env.TELEGRAM_AGENT_MODEL
-const CLAUDE_BIN = process.env.TELEGRAM_CLAUDE_BIN ?? 'claude'
+const AGENT_BIN = AGENT_PROVIDER === 'codex'
+  ? (process.env.TELEGRAM_CODEX_BIN ?? process.env.TELEGRAM_AGENT_BIN ?? 'codex')
+  : (process.env.TELEGRAM_CLAUDE_BIN ?? process.env.TELEGRAM_AGENT_BIN ?? 'claude')
+const CODEX_PROFILE = process.env.TELEGRAM_CODEX_PROFILE
+const CODEX_SANDBOX: 'read-only' | 'workspace-write' | 'danger-full-access' | undefined = (() => {
+  const v = process.env.TELEGRAM_CODEX_SANDBOX
+  if (v == null || v === 'read-only' || v === 'workspace-write' || v === 'danger-full-access') return v
+  process.stderr.write(`telegram daemon: TELEGRAM_CODEX_SANDBOX must be read-only, workspace-write, or danger-full-access; got ${v}\n`)
+  process.exit(1)
+})()
+// Requested default: Codex headless turns run with full approval+sandbox bypass.
+const CODEX_DANGEROUS_BYPASS = AGENT_PROVIDER === 'codex' && process.env.TELEGRAM_CODEX_DANGEROUS_BYPASS !== '0'
 // Stream the agent's reply into one message (placeholder → live edits). On by
 // default; set TELEGRAM_AGENT_STREAM=0 for a single final message instead.
 const AGENT_STREAM = process.env.TELEGRAM_AGENT_STREAM !== '0'
 // Opt-in OS-level confinement (macOS sandbox-exec): writes restricted to the
-// agent's cwd (+ ~/.claude state + temp). Default off.
+// agent's cwd (+ ~/.claude/~/.codex state + temp). Default off.
 const AGENT_SANDBOX = process.env.TELEGRAM_AGENT_SANDBOX === '1'
+// Optional overrides; agent-runner falls back to its own defaults (idle 240s,
+// hard cap 1800s) when these are unset or 0.
+const AGENT_TIMEOUT_MS = Number(process.env.TELEGRAM_AGENT_TIMEOUT_MS) || undefined
+const AGENT_IDLE_MS = Number(process.env.TELEGRAM_AGENT_IDLE_MS) || undefined
+function envMs(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw == null || raw.trim() === '') return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : fallback
+}
+const AGENT_BATCH_MS = envMs('TELEGRAM_AGENT_BATCH_MS', 1500)
+const AGENT_FILE_BATCH_MS = envMs('TELEGRAM_AGENT_FILE_BATCH_MS', 6000)
+const AGENT_INBOX_DIR = process.env.TELEGRAM_AGENT_INBOX_DIR
 if (MULTI_SESSION) {
   initAgentRunner({
     stateDir: STATE_DIR,
     cwd: AGENT_CWD,
-    claudeBin: CLAUDE_BIN,
+    provider: AGENT_PROVIDER,
+    agentBin: AGENT_BIN,
     permissionMode: AGENT_PERMISSION_MODE,
     model: AGENT_MODEL,
+    codexProfile: CODEX_PROFILE,
+    codexSandbox: CODEX_SANDBOX,
+    codexDangerousBypass: CODEX_DANGEROUS_BYPASS,
     sandbox: AGENT_SANDBOX,
+    timeoutMs: AGENT_TIMEOUT_MS,
+    idleMs: AGENT_IDLE_MS,
   })
   process.stderr.write(
-    `telegram daemon: multi-session ON (cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${CLAUDE_BIN}, stream=${AGENT_STREAM}, sandbox=${AGENT_SANDBOX})\n`,
+    `telegram daemon: multi-session ON (provider=${AGENT_PROVIDER}, cwd=${AGENT_CWD}, perm=${AGENT_PERMISSION_MODE}, bin=${AGENT_BIN}, stream=${AGENT_STREAM}, sandbox=${AGENT_SANDBOX}, codexDanger=${CODEX_DANGEROUS_BYPASS}, timeout=${AGENT_TIMEOUT_MS ?? 1_800_000}ms, idle=${AGENT_IDLE_MS ?? 240_000}ms, batch=${AGENT_BATCH_MS}ms, fileBatch=${AGENT_FILE_BATCH_MS}ms)\n`,
   )
 }
 
@@ -131,6 +167,21 @@ export type DaemonFrame =
 
 // ---- Single-instance lifecycle ---------------------------------------------
 
+// Probe whether a live daemon is currently listening on the control socket.
+// connect() succeeding => a daemon is alive; ENOENT/ECONNREFUSED => stale/none.
+function socketAlive(): Promise<boolean> {
+  return new Promise(resolve => {
+    const s = netConnect(SOCKET_PATH)
+    s.once('connect', () => { try { s.destroy() } catch {}; resolve(true) })
+    s.once('error', () => { try { s.destroy() } catch {}; resolve(false) })
+  })
+}
+
+// Replace an existing daemon (intentional restart): SIGTERM the recorded pid and
+// wait until it releases the control socket. Two siblings from one launch both
+// read the SAME old pid here (neither has claimed the pid file yet), so they
+// SIGTERM only the old daemon — never each other. The pid file is claimed later,
+// only by whoever wins the socket bind below.
 try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
   if (stale > 1 && stale !== process.pid) {
@@ -138,16 +189,16 @@ try {
       process.kill(stale, 0)
       process.stderr.write(`telegram daemon: replacing stale daemon pid=${stale}\n`)
       process.kill(stale, 'SIGTERM')
-      await new Promise(r => setTimeout(r, 500))
     } catch { /* not running */ }
   }
 } catch { /* no PID file */ }
 
-if (existsSync(SOCKET_PATH)) {
-  try { unlinkSync(SOCKET_PATH) } catch {}
+// Wait (bounded, ~5s) for the socket to free, so the bind below is the real
+// arbiter. If the old daemon crashed and left a stale socket file, socketAlive()
+// returns false immediately and the bind step removes the leftover.
+for (let i = 0; i < 50 && (await socketAlive()); i++) {
+  await new Promise(r => setTimeout(r, 100))
 }
-
-writeFileSync(PID_FILE, String(process.pid))
 
 let shuttingDown = false
 
@@ -289,7 +340,18 @@ function effectiveSendThreadId(raw: string | number | undefined | null): number 
 }
 
 function safeName(s: string | undefined): string | undefined {
-  return s?.replace(/[<>\[\]\r\n;]/g, '_')
+  const cleaned = s
+    ?.replace(/[<>\[\]\r\n;:/\\]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!cleaned || cleaned === '.' || cleaned === '..') return undefined
+  return cleaned.slice(0, 180)
+}
+
+function expandHomePath(p: string): string {
+  if (p === '~') return homedir()
+  if (p.startsWith('~/')) return join(homedir(), p.slice(2))
+  return p
 }
 
 // Local speech-to-text via whisper.cpp. Audio never leaves the machine; no API
@@ -516,6 +578,39 @@ function tgMarkdown(text: string): string | null {
   }
 }
 
+/** Bot API 10.1 Rich Messages. OFF by default; enable with AGENT_RICH=1.
+ *  Sends the assistant Markdown as a native rich message — tables, headings,
+ *  code blocks, lists, quotes render client-side, up to 32768 chars (no
+ *  chunking). grammy 1.41 has no typed method for this yet, so we go through
+ *  the raw proxy (it forwards any method name to callApi). Returns true on a
+ *  successful send; false (incl. when the flag is off or the API rejects it)
+ *  means the caller should fall back to the existing MarkdownV2/plain path. */
+const AGENT_RICH = process.env.AGENT_RICH === '1'
+// Monotonic, non-zero draft id for sendRichMessageDraft. Reused within one
+// streaming turn so Telegram animates the updates; new per turn.
+let __draftSeq = 0
+const nextDraftId = (): number => (__draftSeq = (__draftSeq + 1) % 2_000_000_000) + 1
+async function sendRich(
+  chat_id: string,
+  tid: number | undefined,
+  markdown: string,
+  baseOpts: Record<string, unknown>,
+): Promise<boolean> {
+  if (!AGENT_RICH) return false
+  try {
+    await (bot.api.raw as any).sendRichMessage({
+      chat_id,
+      ...(tid != null ? { message_thread_id: tid } : {}),
+      ...baseOpts,
+      rich_message: { markdown },
+    })
+    return true
+  } catch (e) {
+    process.stderr.write(`telegram daemon: sendRichMessage failed, falling back: ${e}\n`)
+    return false
+  }
+}
+
 async function sendAgentReply(
   chat_id: string,
   threadId: number | undefined,
@@ -527,6 +622,8 @@ async function sendAgentReply(
     ...(replyTo != null ? { reply_parameters: { message_id: replyTo } } : {}),
     ...(tid != null ? { message_thread_id: tid } : {}),
   }
+  // Native rich message first (flagged); falls through to MarkdownV2/plain.
+  if (await sendRich(chat_id, tid, text, baseOpts)) return
   // Prefer a single MarkdownV2 message so formatting renders; fall back to plain.
   const md = tgMarkdown(text)
   if (md != null && md.length <= MAX_CHUNK_LIMIT) {
@@ -567,8 +664,16 @@ async function streamAgentReply(
   }
   let mid: number | undefined
   const stopKb = new InlineKeyboard().text('⏹ Стоп', `stop:${chat_id}:${tkey ?? ''}`)
+  // Шаг B (flagged): live streaming via sendRichMessageDraft. Private chats only
+  // (the method takes a numeric private chat_id; supergroup ids are negative).
+  // The ⌛ placeholder + Stop button stay for control and graceful fallback; the
+  // draft is the animated rich preview, and the final persist is sendRich() below.
+  const useDraft = AGENT_RICH && !chat_id.startsWith('-')
+  const draft_id = nextDraftId()
+  const escHtml = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   try {
-    const ph = await bot.api.sendMessage(chat_id, '⌛', { ...baseOpts, reply_markup: stopKb })
+    const ph = await bot.api.sendMessage(chat_id, '💭 Думаю…', { ...baseOpts, reply_markup: stopKb })
     mid = ph.message_id
   } catch (e) {
     process.stderr.write(`telegram daemon: placeholder send failed: ${e}\n`)
@@ -580,6 +685,7 @@ async function streamAgentReply(
   const STREAM_CAP = 4000 // stay under the 4096 editMessageText limit while live
   let lastEdit = 0
   let lastShown = ''
+  let lastBar = ''  // last text on the status+Stop placeholder (draft mode)
   let acc = ''     // streamed answer text so far
   let status = ''  // current activity (💭 thinking / ⚙️ tool) during gaps
   let timer: ReturnType<typeof setTimeout> | null = null
@@ -588,11 +694,39 @@ async function streamAgentReply(
     if (mid == null) return
     // Show the answer text; while a tool/think runs with no new text, show the
     // activity (appended after any text, or alone before the first token).
-    const base = acc ? (status ? `${acc}\n\n${status}` : acc) : (status || '⌛')
+    const base = acc ? (status ? `${acc}\n\n${status}` : acc) : (status || '💭 Думаю…')
     const body = base.length > STREAM_CAP ? base.slice(0, STREAM_CAP) + ' …' : base
     if (body === lastShown) return
     lastEdit = Date.now()
     lastShown = body
+    if (useDraft) {
+      // Keep the placeholder as a compact status+Stop bar (not a bare ⌛): show
+      // the current activity, or "answering" once text flows. The animated rich
+      // answer itself streams via the draft below; Stop lives on this bar.
+      const bar = status || (acc ? '✍️ Отвечаю…' : '💭 Думаю…')
+      if (mid != null && bar !== lastBar) {
+        lastBar = bar
+        bot.api.editMessageText(chat_id, mid, bar, { reply_markup: stopKb }).catch(() => {})
+      }
+      // Activity-only (no answer text yet) → native <tg-thinking> block; once text
+      // streams → markdown. Partial markdown can be rejected mid-stream → fall back
+      // to a plain edit on the bar so the live view never stalls.
+      const rich =
+        status && !acc
+          ? { html: `<tg-thinking>${escHtml(status)}</tg-thinking>` }
+          : { markdown: body }
+      ;(bot.api.raw as any)
+        .sendRichMessageDraft({
+          chat_id: Number(chat_id),
+          ...(tid != null ? { message_thread_id: tid } : {}),
+          draft_id,
+          rich_message: rich,
+        })
+        .catch(() => {
+          if (mid != null) bot.api.editMessageText(chat_id, mid, body, { reply_markup: stopKb }).catch(() => {})
+        })
+      return
+    }
     bot.api.editMessageText(chat_id, mid, body, { reply_markup: stopKb }).catch((e: unknown) => {
       // Ignore "message is not modified" (400); back off on rate limit (429).
       const ra = e instanceof GrammyError ? e.parameters?.retry_after : undefined
@@ -621,6 +755,12 @@ async function streamAgentReply(
   const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
   const mode = access.chunkMode ?? 'length'
   const body = finalText || '(empty)'
+
+  // Native rich message first (flagged): send it, then drop the ⌛ placeholder.
+  if (await sendRich(chat_id, tid, body, baseOpts)) {
+    if (mid != null) await bot.api.deleteMessage(chat_id, mid).catch(() => {})
+    return
+  }
 
   // Final render: prefer a single MarkdownV2 message so formatting renders;
   // fall back to plain, chunked, on conversion/length/API failure.
@@ -681,6 +821,22 @@ async function dispatchRpc(method: string, params: Record<string, unknown>, _c: 
       })
       return { message_id: sent.message_id }
     }
+    case 'sendRichMessage': {
+      // Bot API 10.1 rich message; markdown rendered natively (no chunking).
+      // grammy has no typed method yet → raw proxy. Caller (server.ts) falls
+      // back to chunked sendMessage if this throws.
+      const chat_id = String(params.chat_id)
+      const text = String(params.text)
+      const reply_to = params.reply_to != null ? Number(params.reply_to) : undefined
+      const thread_id = effectiveSendThreadId(params.thread_id as string | number | undefined)
+      const sent = await (bot.api.raw as any).sendRichMessage({
+        chat_id,
+        ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
+        ...(thread_id != null ? { message_thread_id: thread_id } : {}),
+        rich_message: { markdown: text },
+      })
+      return { message_id: sent.message_id }
+    }
     case 'sendPhoto':
     case 'sendDocument': {
       const chat_id = String(params.chat_id)
@@ -708,6 +864,16 @@ async function dispatchRpc(method: string, params: Record<string, unknown>, _c: 
       const chat_id = String(params.chat_id)
       const message_id = Number(params.message_id)
       const text = String(params.text)
+      if (params.rich) {
+        // Bot API 10.1: replace message content with a native rich message.
+        const edited = await (bot.api.raw as any).editMessageText({
+          chat_id,
+          message_id,
+          rich_message: { markdown: text },
+        })
+        const mid = typeof edited === 'object' ? edited.message_id : message_id
+        return { message_id: mid }
+      }
       const parseMode = params.parse_mode as 'MarkdownV2' | undefined
       const edited = await bot.api.editMessageText(chat_id, message_id, text,
         ...(parseMode ? [{ parse_mode: parseMode }] : []),
@@ -822,14 +988,40 @@ function handleClientFrame(c: Client, frame: ClientFrame): void {
   }
 }
 
-ipcServer.on('error', err => {
-  process.stderr.write(`telegram daemon: ipc server error: ${err}\n`)
-  shutdown(1)
-})
-
-ipcServer.listen(SOCKET_PATH, () => {
-  try { chmodSync(SOCKET_PATH, 0o600) } catch {}
-  process.stderr.write(`telegram daemon: listening on ${SOCKET_PATH} pid=${process.pid}\n`)
+// Acquire the control socket as an exclusive singleton lock, then gate Telegram
+// polling on it (bot.start runs only after this resolves). Binding is the
+// authority: whoever binds is THE daemon. A loser — e.g. a sibling from the same
+// launch — finds a live owner and exits *before* polling, so two daemons never
+// collide on getUpdates (the 409 Conflict storm). A stale socket left by a
+// crashed daemon (connection refused) is detected and removed.
+await new Promise<void>(resolve => {
+  const attempt = (n: number) => {
+    const onError = async (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE') {
+        if (await socketAlive()) {
+          process.stderr.write(`telegram daemon: another daemon owns the socket — standing down (pid=${process.pid})\n`)
+          process.exit(0)
+        }
+        try { unlinkSync(SOCKET_PATH) } catch {}
+        if (n < 5) return attempt(n + 1)
+      }
+      process.stderr.write(`telegram daemon: cannot bind control socket: ${err} — exiting\n`)
+      process.exit(1)
+    }
+    ipcServer.once('error', onError)
+    ipcServer.listen(SOCKET_PATH, () => {
+      ipcServer.off('error', onError)
+      try { chmodSync(SOCKET_PATH, 0o600) } catch {}
+      writeFileSync(PID_FILE, String(process.pid))
+      ipcServer.on('error', e => {
+        process.stderr.write(`telegram daemon: ipc server error: ${e}\n`)
+        shutdown(1)
+      })
+      process.stderr.write(`telegram daemon: listening on ${SOCKET_PATH} pid=${process.pid}\n`)
+      resolve()
+    })
+  }
+  attempt(0)
 })
 
 // ---- Bot construction & inbound flow --------------------------------------
@@ -843,6 +1035,196 @@ type AttachmentMeta = {
   size?: number
   mime?: string
   name?: string
+}
+
+type AgentAttachment = AttachmentMeta & {
+  path?: string
+  error?: string
+}
+
+type AgentInboundItem = {
+  chat_id: string
+  threadId: number | undefined
+  tkey: string | undefined
+  messageId: number | undefined
+  user: string
+  user_id: string
+  ts: string
+  text: string
+  mediaGroupId?: string
+  attachments: AgentAttachment[]
+  attachmentDownloads: Promise<AgentAttachment>[]
+}
+
+type AgentBatch = {
+  chat_id: string
+  threadId: number | undefined
+  tkey: string | undefined
+  replyTo: number | undefined
+  hasAttachment: boolean
+  items: AgentInboundItem[]
+  timer: ReturnType<typeof setTimeout>
+}
+
+const agentBatches = new Map<string, AgentBatch>()
+
+function getMediaGroupId(ctx: Context): string | undefined {
+  const mediaGroupId = (ctx.message as { media_group_id?: unknown } | undefined)?.media_group_id
+  return typeof mediaGroupId === 'string' && mediaGroupId ? mediaGroupId : undefined
+}
+
+function agentBatchKey(chat_id: string, tkey: string | undefined): string {
+  return `${chat_id}:${tkey ?? ''}`
+}
+
+function agentInboxBase(chat_id: string, tkey: string | undefined): string {
+  const topicDir = `${chat_id}_${tkey ?? 'main'}`.replace(/[^a-zA-Z0-9_.-]/g, '_')
+  const base = AGENT_INBOX_DIR
+    ? expandHomePath(AGENT_INBOX_DIR)
+    : join(getTopicCwd(chat_id, tkey), '.telegram-inbox')
+  return join(base, topicDir)
+}
+
+function fileExtFromTelegramPath(filePath: string, fallback = 'bin'): string {
+  const last = filePath.split('/').pop() ?? ''
+  const dot = last.lastIndexOf('.')
+  const ext = dot >= 0 ? last.slice(dot + 1).replace(/[^a-zA-Z0-9]/g, '') : ''
+  return ext || fallback
+}
+
+function localAttachmentName(meta: AttachmentMeta, filePath: string, uniq: string): string {
+  const ext = fileExtFromTelegramPath(filePath, meta.kind === 'photo' ? 'jpg' : 'bin')
+  const original = safeName(meta.name)
+  const leaf = original && /\.[^.]{1,12}$/.test(original)
+    ? original
+    : `${original ?? meta.kind}.${ext}`
+  return `${Date.now()}-${randomBytes(3).toString('hex')}-${uniq}-${leaf}`
+}
+
+async function downloadAgentAttachment(
+  chat_id: string,
+  tkey: string | undefined,
+  meta: AttachmentMeta,
+): Promise<AgentAttachment> {
+  if (meta.size != null && meta.size > MAX_ATTACHMENT_BYTES) {
+    return { ...meta, error: `too large: ${meta.size} bytes > ${MAX_ATTACHMENT_BYTES}` }
+  }
+  try {
+    const file = await bot.api.getFile(meta.file_id)
+    if (!file.file_path) return { ...meta, error: 'Telegram returned no file_path' }
+    const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`)
+    if (!res.ok) return { ...meta, error: `download failed: HTTP ${res.status}` }
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (buf.length > MAX_ATTACHMENT_BYTES) {
+      return { ...meta, size: buf.length, error: `too large: ${buf.length} bytes > ${MAX_ATTACHMENT_BYTES}` }
+    }
+    const uniq = (file.file_unique_id ?? 'dl').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+    const dir = agentInboxBase(chat_id, tkey)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const path = join(dir, localAttachmentName(meta, file.file_path, uniq))
+    writeFileSync(path, buf, { mode: 0o600 })
+    return { ...meta, size: meta.size ?? buf.length, path }
+  } catch (e) {
+    return { ...meta, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+function formatAttachment(a: AgentAttachment): string {
+  const bits = [
+    `${a.kind}${a.name ? ` "${a.name}"` : ''}`,
+    a.path ? `local_path=${a.path}` : undefined,
+    a.mime ? `mime=${a.mime}` : undefined,
+    a.size != null ? `size_bytes=${a.size}` : undefined,
+    a.error ? `download_error=${a.error}` : undefined,
+  ].filter(Boolean)
+  return `- ${bits.join(' | ')}`
+}
+
+function formatBatchItem(item: AgentInboundItem, idx: number, total: number): string {
+  const title = total > 1
+    ? `${idx + 1}. Message from ${item.user} at ${item.ts}${item.mediaGroupId ? ` media_group=${item.mediaGroupId}` : ''}`
+    : `Message from ${item.user} at ${item.ts}${item.mediaGroupId ? ` media_group=${item.mediaGroupId}` : ''}`
+  const lines = [title, item.text.trim() || '(no text)']
+  if (item.attachments.length) {
+    lines.push('', 'Attachments downloaded locally. Use local_path values to inspect files:')
+    for (const a of item.attachments) lines.push(formatAttachment(a))
+  }
+  return lines.join('\n')
+}
+
+function buildAgentBatchPrompt(items: AgentInboundItem[]): string {
+  if (items.length === 1 && items[0].attachments.length === 0) return items[0].text
+  const total = items.length
+  const intro = total > 1
+    ? `Telegram batch: ${total} messages arrived close together. Treat them as one user request and answer once.`
+    : 'Telegram message with local attachments.'
+  return [
+    intro,
+    '',
+    ...items.map((item, idx) => formatBatchItem(item, idx, total)),
+  ].join('\n\n')
+}
+
+function enqueueAgentInbound(item: AgentInboundItem): void {
+  const key = agentBatchKey(item.chat_id, item.tkey)
+  const existing = agentBatches.get(key)
+  const hasAttachment = item.attachments.length > 0 || item.attachmentDownloads.length > 0
+  if (existing) {
+    clearTimeout(existing.timer)
+    existing.items.push(item)
+    existing.replyTo = item.messageId
+    existing.hasAttachment = existing.hasAttachment || hasAttachment || !!item.mediaGroupId
+    const delay = existing.hasAttachment ? AGENT_FILE_BATCH_MS : AGENT_BATCH_MS
+    existing.timer = setTimeout(() => {
+      void flushAgentBatch(key).catch(err => process.stderr.write(`telegram daemon: agent batch failed: ${err}\n`))
+    }, delay)
+    return
+  }
+
+  const batch: AgentBatch = {
+    chat_id: item.chat_id,
+    threadId: item.threadId,
+    tkey: item.tkey,
+    replyTo: item.messageId,
+    hasAttachment: hasAttachment || !!item.mediaGroupId,
+    items: [item],
+    timer: setTimeout(() => {
+      void flushAgentBatch(key).catch(err => process.stderr.write(`telegram daemon: agent batch failed: ${err}\n`))
+    }, hasAttachment || item.mediaGroupId ? AGENT_FILE_BATCH_MS : AGENT_BATCH_MS),
+  }
+  agentBatches.set(key, batch)
+}
+
+async function flushAgentBatch(key: string): Promise<void> {
+  const batch = agentBatches.get(key)
+  if (!batch) return
+  clearTimeout(batch.timer)
+  agentBatches.delete(key)
+
+  for (const item of batch.items) {
+    if (item.attachmentDownloads.length) {
+      item.attachments.push(...await Promise.all(item.attachmentDownloads))
+      item.attachmentDownloads = []
+    }
+  }
+
+  const prompt = buildAgentBatchPrompt(batch.items)
+  if (AGENT_STREAM) {
+    await streamAgentReply(batch.chat_id, batch.threadId, batch.tkey, prompt, batch.replyTo)
+    return
+  }
+  try {
+    const reply = await runAgentTurn(batch.chat_id, batch.tkey, prompt)
+    await sendAgentReply(batch.chat_id, batch.threadId, reply, batch.replyTo)
+  } catch (err) {
+    process.stderr.write(`telegram daemon: agent turn failed: ${err}\n`)
+    await sendAgentReply(
+      batch.chat_id,
+      batch.threadId,
+      `⚠️ agent error: ${err instanceof Error ? err.message : String(err)}`,
+      batch.replyTo,
+    )
+  }
 }
 
 async function handleInbound(
@@ -866,6 +1248,7 @@ async function handleInbound(
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
   const threadId = ctx.message?.message_thread_id
+  const mediaGroupId = getMediaGroupId(ctx)
 
   // Permission-reply intercept: "yes xxxxx" / "no xxxxx" → resolve and route
   // back to the originating client.
@@ -925,8 +1308,8 @@ async function handleInbound(
     }
   }
 
-  // Multi-session: hand the message to this topic's own Claude agent and reply
-  // back into the same topic. (Phase 1 ignores images/attachments — text only.)
+  // Multi-session: hand messages to this topic's own Claude/Codex agent. Quick
+  // bursts are batched so a pile of files produces one turn and one reply.
   if (MULTI_SESSION) {
     const tkey = threadId != null ? String(threadId) : undefined
 
@@ -958,23 +1341,19 @@ async function handleInbound(
         return
       }
 
-      if (AGENT_STREAM) {
-        void streamAgentReply(chat_id, threadId, tkey, content, msgId).catch(err => {
-          process.stderr.write(`telegram daemon: agent stream failed: ${err}\n`)
-        })
-      } else {
-        void runAgentTurn(chat_id, tkey, content)
-          .then(reply => sendAgentReply(chat_id, threadId, reply, msgId))
-          .catch(err => {
-            process.stderr.write(`telegram daemon: agent turn failed: ${err}\n`)
-            return sendAgentReply(
-              chat_id,
-              threadId,
-              `⚠️ agent error: ${err instanceof Error ? err.message : String(err)}`,
-              msgId,
-            )
-          })
-      }
+      enqueueAgentInbound({
+        chat_id,
+        threadId,
+        tkey,
+        messageId: msgId,
+        user: from.username ? `@${from.username}` : String(from.id),
+        user_id: String(from.id),
+        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+        text: content,
+        mediaGroupId,
+        attachments: [],
+        attachmentDownloads: attach ? [downloadAgentAttachment(chat_id, tkey, attach)] : [],
+      })
       return
     }
     // human-bound topic → fall through to the MCP broadcast below
@@ -1132,9 +1511,9 @@ bot.on('message:text', async ctx => {
 
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
+  const photos = ctx.message.photo
+  const best = photos[photos.length - 1]
   await handleInbound(ctx, caption, async () => {
-    const photos = ctx.message.photo
-    const best = photos[photos.length - 1]
     try {
       const file = await bot.api.getFile(best.file_id)
       if (!file.file_path) return undefined
@@ -1149,6 +1528,8 @@ bot.on('message:photo', async ctx => {
       writeFileSync(path, buf)
       return path
     } catch { return undefined }
+  }, {
+    kind: 'photo', file_id: best.file_id, size: best.file_size, mime: 'image/jpeg',
   })
 })
 
@@ -1228,8 +1609,18 @@ try {
 // ---- Polling loop ----------------------------------------------------------
 
 void (async () => {
+  try {
+    process.stderr.write('telegram daemon: initializing bot\n')
+    await bot.init()
+    botUsername = bot.botInfo.username
+    process.stderr.write(`telegram daemon: initialized @${botUsername}\n`)
+  } catch (err) {
+    process.stderr.write(`telegram daemon: bot init failed: ${err}\n`)
+    shutdown(1)
+  }
   for (let attempt = 1; ; attempt++) {
     try {
+      process.stderr.write(`telegram daemon: starting polling attempt ${attempt}\n`)
       await bot.start({
         onStart: info => {
           attempt = 0
